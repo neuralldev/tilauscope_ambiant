@@ -1,0 +1,6 @@
+.pio
+.vscode/
+*.pyc
+__pycache__/
+test
+compile*.json
