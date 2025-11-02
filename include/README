@@ -2,20 +2,72 @@
 
 TilauScope Ambiant probe support
 
-## 📡 ESP32 + BME280 BLE Environmental Monitor
+## ESP32 + BME280 BLE Environmental Monitor
 
-Ce projet utilise un **ESP32 Weil** pour lire les données environnementales (température, humidité, pression, altitude) via un capteur **BME280** en I2C, et les diffuser en **Bluetooth Low Energy (BLE)** avec des **UUID personnalisés**. Il est conçu pour s’intégrer facilement dans des workflows du **TilauScope** pour le suivi de la torréfaction.
+The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy (BLE) peripheral to broadcast environmental data (Temperature, Humidity, Pressure, and Altitude). It utilizes the Adafruit BME280 sensor for measurements.
 
----
+## Features
 
-## 🔧 Matériel
+**Wireless Data**: Uses BLE (NimBLE stack) for low-power, short-range data transmission.
+**BME280 Sensor Integration**: Reads Temperature, Humidity, Pressure, and Altitude.
+**Unique Naming**: Generates a unique device name based on the ESP32's MAC address (TilauScope-Ambiant-XXXX).
+**Efficient Data Format**: Transmits all sensor data in a single, compact, 17-byte packed structure with fixed-point scaling and a checksum.
+**Status Indicator**: Uses the onboard LED for connection and advertising status.
+**Robustness**: Includes a Simulation Mode fallback if the BME280 sensor is not detected.
 
-- ESP32 Wroom
-- BME280 (mode I2C)
+## Hardware Requirements
 
-### Câblage
+|Component              |Function                |Configuration                                 |
+|-----------------------|------------------------|----------------------------------------------|
+|Microcontroller        |ESP32 Development Board |NimBLE Stack                                  |
+|Environmental Sensor   |Adafruit BME280 (I2C)   |Addresses: 0x76 (Primary) or 0x77 (Alternate) |
+|I2C SDA Pin            |Data line for BME280    |GPIO 21 (SDA_PIN)                             |
+|I2C SCL Pin            |Clock line for BME280   |GPIO 22 (SCL_PIN)                             |
+|Status LED             |Visual indicator        |GPIO 2 (LED_PIN)                              |
 
-| BME280 | ESP32 Weil | Fonction         |
+## software and dependencies
+
+This project is built for the Arduino IDE or PlatformIO targeting the ESP32.
+
+### Required Librarie
+
+Install the following libraries via the Arduino Library Manager or PlatformIO Registry:
+
+NimBLE-Arduino (or ESP32 BLE Library): For the Bluetooth Low Energy stack.
+Adafruit BME280 Library
+Adafruit Unified Sensor Library
+
+### Data Structure and Format
+
+The data is packaged into a (17-bytes) struct (EnvData) using fixed-point representation (x10 scaling) for efficiency.
+
+### Decoding the Data
+
+Toretrieve the actual floating-point values, the received integer value must be divided by x 10.Checksum Verification: The checksum is calculated over the (12-byte) data payload (from temp_x10 to alt_x10). Clients should re-calculate this checksum and compare it to the received checksum field to ensure data integrity. all the values are coded in Little-Endian
+
+payload is structured this way:
+
+| HEADER    | temp 28.8°C | hum 77.1% | press 990.1 mPa | alt 30masl   | checksum | footer   |
+|-----------|-------------|-----------|-----------------|--------------|----------|----------|
+| 0x55 0x55 | 01 20       | 03 03     | 00 00 26 AD     |  00 00 00 1E |    nn    | 0xaa 0xaa|
+
+### Operation & Status Indicators
+
+The built-in LED **GPIO2** provides a visual indication of the device's state. when the device is correctly started it should blink once per second
+
+## Simulation Mode
+
+If the device fails to initialize the BME280 sensor (e.g., wiring error or sensor not present), it will automatically switch to Simulation Mode.
+
+    - Function: The onRead callback will generate smooth, sinusoidal, dummy environmental data instead of reading the sensor.
+
+    - Purpose: Allows for testing the BLE connectivity and data parsing logic of the client application without requiring the physical sensor to be connected.
+
+    - Serial Output: The device will log the message: BME280 not detected, errorr, enter simulation mode during setup.
+
+### Câblinf
+
+| BME280 | ESP32 WROOM | Fonction         |
 |--------|-------------|------------------|
 | VCC    | 3.3V        | Alimentation     |
 | GND    | GND         | Masse            |
@@ -27,18 +79,11 @@ Ce projet utilise un **ESP32 Weil** pour lire les données environnementales (te
 
 ---
 
-## 🧬 UUID BLE personnalisés
+## UUID BLE used by project
 
 | Caractéristique | UUID                                     |
 |-----------------|------------------------------------------|
 | Service         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c01`   |
 | data            | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05`   |
 
----
-
-## ⚙️ Compilation avec PlatformIO
-
-1. Cloner le dépôt :
-
-```bash
-git clone https://github.com/neuralldev/tilauscope_ambiant/
+The **service** UUID is used only for advertising. data exchange is done using the **data** UUID. At the moment data only accept READ to query for value. the payload is returned and must be unpacked.
