@@ -1,7 +1,9 @@
-.pio
+.pio/
 .vscode/
 *.pyc
 __pycache__/
 test
 compile*.json
 .DS_Code
+*.dblite
+*.json
