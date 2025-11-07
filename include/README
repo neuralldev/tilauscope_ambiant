@@ -23,7 +23,6 @@ The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy
 |Environmental Sensor   |Adafruit BME280 (I2C)   |Addresses: 0x76 (Primary) or 0x77 (Alternate) |
 |I2C SDA Pin            |Data line for BME280    |GPIO 21 (SDA_PIN)                             |
 |I2C SCL Pin            |Clock line for BME280   |GPIO 22 (SCL_PIN)                             |
-|Status LED             |Visual indicator        |GPIO 2 (LED_PIN)                              |
 
 ## software and dependencies
 
@@ -36,24 +35,55 @@ Install the following libraries via the Arduino Library Manager or PlatformIO Re
 NimBLE-Arduino (or ESP32 BLE Library): For the Bluetooth Low Energy stack.
 Adafruit BME280 Library
 Adafruit Unified Sensor Library
+arduinoFFT Library
 
 ### Data Structure and Format
 
-The data is packaged into a (17-bytes) struct (EnvData) using fixed-point representation (x10 scaling) for efficiency.
+Data of ambiant information is packaged into a (17-bytes) struct (EnvData) using fixed-point representation (x10 scaling) for efficiency. Data of audio information is packaged into a (7-bytes) struct (AudioData) using int16 representation.
 
 ### Decoding the Data
 
-Toretrieve the actual floating-point values, the received integer value must be divided by x 10.Checksum Verification: The checksum is calculated over the (12-byte) data payload (from temp_x10 to alt_x10). Clients should re-calculate this checksum and compare it to the received checksum field to ensure data integrity. all the values are coded in Little-Endian
+To retrieve the actual floating-point values, the received integer value must be divided by x 10.Checksum Verification: The checksum is calculated over the (12-byte) data payload (from temp_x10 to alt_x10). Clients should re-calculate this checksum and compare it to the received checksum field to ensure data integrity. all the values are coded in Little-Endian
 
-payload is structured this way:
+Ambiant payload is structured this way:
 
 | HEADER    | temp 28.8°C | hum 77.1% | press 990.1 mPa | alt 30masl   | checksum | footer   |
 |-----------|-------------|-----------|-----------------|--------------|----------|----------|
 | 0x55 0x55 | 01 20       | 03 03     | 00 00 26 AD     |  00 00 00 1E |    nn    | 0xaa 0xaa|
 
+Audio payload to retrieve contains the actual crack counter when you read the audio characteristic
+
+| HEADER    | crack count | checksum | footer   |
+|-----------|-------------|----------|----------|
+| 0x55 0x55 | 00 10       |    nn    | 0xaa 0xaa|
+
+(crack count is int16 structure, here it is 0x10 -> 17 in decimal)
+
+when writing to the audio characteristic, sending a packet structure can trigger the crack counter logic:
+
+| HEADER    | crack count | checksum | footer   | function                                                                 |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 00 00       |    nn    | 0xaa 0xaa| Run calibration. the process last after 30 seconds                       |
+|                                               | function 1 and 2 are ignored until calibration has been successfully run |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 00 01       |    nn    | 0xaa 0xaa| ask the probe to start to detect cracks, the counter is incremented      |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 00 02       |    nn    | 0xaa 0xaa| ask the probe to stop to detect cracks, the counter is reset to 0        |
+
+(the first byte is 0x00 and reserved for future use)
+
 ### Operation & Status Indicators
 
 The built-in LED **GPIO2** provides a visual indication of the device's state. when the device is correctly started it should blink once per second
+
+to operate, use the following:
+
+- wait for the probe to boot (automatic using TilauScope fork)
+- try to detect the probe on the service UUID (automatic using TilauScope fork)
+- start collecting data reading Ambiant UUID (automatic using TilauScope fork mapping an extra device to the 4 values)
+- at DE, call CALIBRATION (function 0) writing to Audio UUID
+- at DE+1mn call START DETECTION (function 1) writing to Audio UUID
+- at DROP call STOP DETECTION (function 2) writing to Audio UUID
 
 ## Simulation Mode
 
@@ -65,25 +95,36 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 
     - Serial Output: The device will log the message: BME280 not detected, errorr, enter simulation mode during setup.
 
-### Câblinf
+### cabling information
 
-| BME280 | ESP32 WROOM | Fonction         |
-|--------|-------------|------------------|
-| VCC    | 3.3V        | Alimentation     |
-| GND    | GND         | Masse            |
-| SDA    | GPIO 21     | Données série    |
-| SCL    | GPIO 22     | Horloge série    |
+| BME280 | ESP32 WROOM | Fonction          |
+|--------|-------------|-------------------|
+| VCC    | 3.3V        | Power             |
+| GND    | GND         | Ground            |
+| SDA    | GPIO 21     | Data              |
+| SCL    | GPIO 22     | Clock             |
+
+|NMP441     | ESP32    | Fonction          |
+|-----------|----------|-------------------|
+|VDD        | 3.3 V    | Power             |
+|GND        | GND      | Ground            |
+|WS (LRCL)  | GPIO 13  | Word Select       |
+|SCK (BCLK) | GPIO 14  | Bit Clock         |
+|SD (DOUT)  | GPIO 34  | Data              |
+|L/R        | GND      | Left channel only |
 
 [esp32 module](esp32.png)
 [bme280 probe](bme280.png)
+[nmp441](nmp441.png)
 
 ---
 
 ## UUID BLE used by project
 
-| Caractéristique | UUID                                     |
-|-----------------|------------------------------------------|
-| Service         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c01`   |
-| data            | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05`   |
+| Caractéristique | UUID                                   |
+|-----------------|----------------------------------------|
+| Service         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c01` |
+| ambiant         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05` |
+| audio           | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c04` |
 
 The **service** UUID is used only for advertising. data exchange is done using the **data** UUID. At the moment data only accept READ to query for value. the payload is returned and must be unpacked.
