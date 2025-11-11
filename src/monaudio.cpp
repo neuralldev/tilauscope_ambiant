@@ -1,6 +1,7 @@
 // audio processing part
 #include "monaudio.h"
 #include <Wire.h>
+#include "common.h"
 
 /*
 Brochage typique INMP441 ↔ ESP32
@@ -57,7 +58,6 @@ typedef struct __attribute__((packed))
   uint16_t footer = 0xAAAA; // End of message footer
 } AudioCommand;
 
-
 // --- FFT band energy ---
 double bandEnergy(double *v, int lowHz, int highHz)
 {
@@ -71,9 +71,9 @@ double bandEnergy(double *v, int lowHz, int highHz)
 
 void calibrateTask(void *pvParameters)
 {
-    Serial.println("Calibrating in background task...");
+    Serial.println("Audio process - calibrating in background (30 seconds lock on audio features)...");
 
-    calibrating = true;
+    calibrating = true; // just in case it, normaly set y task launcher
     double accumEnergy = 0, accumSq = 0;
     int count = 0;
     bool bIsCalibrated;
@@ -107,21 +107,20 @@ void calibrateTask(void *pvParameters)
         // Give control back to the scheduler for other tasks (optional but good practice)
         vTaskDelay(1); 
     }
-
     // --- Post-Calibration Processing ---
     if (count == 0)
     {
-        Serial.println("calibration failed");
-        bIsCalibrated = false;
+        Serial.println("Audio process - calibration has failed, no data was fetched");
+        bIsCalibrated = false; // cannot unlock other audio features 
     }
     else
     {
         noiseMean = accumEnergy / count;
         noiseStd = sqrt((accumSq / count) - (noiseMean * noiseMean));
         energyThreshold = noiseMean + 3 * noiseStd;
-        Serial.printf("Calibration done: average noise = %.2f | treshold = %.2f\n", noiseMean, energyThreshold);
-        crack_counter = 0;
-        bIsCalibrated = true;
+        Serial.printf("Audio process - calibration is done: average noise = %.2f | treshold = %.2f\n", noiseMean, energyThreshold);
+        crack_counter = 0; // reset crack counter
+        bIsCalibrated = true; // set flag to allow to unlock audio features
     }
     
     // Clean up
@@ -135,32 +134,33 @@ void calibrateTask(void *pvParameters)
 void calibrate()
 {
   if (calibrating) {
-        Serial.println("Calibration already running.");
+        Serial.println("Audio process - Calibration already running!");
         return;
     }
-    
-    Serial.println("Starting Calibration Task...");
-    
-    // Create the task
-    xTaskCreatePinnedToCore(
-        calibrateTask,          // Task function
-        "CalibrateTask",        // Name for the task
-        4096,                   // Stack size (increase if needed)
-        NULL,                   // Parameter to pass
-        1,                      // Priority (1 is usually fine)
-        &calibrateTaskHandle,   // Task handle (for referencing)
-        1                       // Core to run on (Core 1 is good for non-BLE/WiFi tasks)
-    );
+  // locck access to calibration
+  calibrating = true;
+  Serial.println("Audio process - Starting Calibration Task...");
+
+  // Create the task
+  xTaskCreatePinnedToCore(
+      calibrateTask,          // Task function
+      "CalibrateTask",        // Name for the task
+      4096,                   // Stack size (increase if needed)
+      NULL,                   // Parameter to pass
+      1,                      // Priority (1 is usually fine)
+      &calibrateTaskHandle,   // Task handle (for referencing)
+      1                       // Core to run on (Core 1 is good for non-BLE/WiFi tasks)
+  );
 }
 
 
 void monitorAudioTask(void *pvParameters)
 {
-    Serial.println("Audio Monitoring Task started.");
+    Serial.println("Audio process - Monitoring Task starting");
 
     while (1) // The task runs forever unless explicitly deleted
     {
-        // 1. Check Control Flags: Only run core logic if calibrated AND started
+        // Check Control Flags: Only run core logic if calibrated AND started
         if (isCalibrated && crackCounterStatus) 
         {
             // --- Core Logic from original monitorAudio() ---
@@ -197,10 +197,7 @@ void monitorAudioTask(void *pvParameters)
                         // (though in this design, it's mostly modified here and read in BLE callback)
                         crack_counter++; 
                         lastCrackTime = now;
-                        Serial.printf("crack detected! Count = %d (energy %.2f)\n", crack_counter, crackEnergy);
-
-                        // ⚠️ You might want to add a call to pCharacteristic->notify() here 
-                        // if you want immediate notification of a crack.
+                        Serial.printf("Audio process - Monitoring - crack detected! count=%d (energy %.2f)\n", crack_counter, crackEnergy);
                     }
                 }
             }
@@ -213,48 +210,6 @@ void monitorAudioTask(void *pvParameters)
     }
 }
 
-// --- Crack detection thread---
-void monitorAudio()
-{
-  if (!isCalibrated) // avoid detecting if calibration failed
-    return;
-
-  int32_t raw[BUFFER_SIZE];
-  size_t bytesRead = 0;
-
-  // reading audio from I2S
-  esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
-  if (result != ESP_OK || bytesRead == 0)
-    return; // on error abort
-
-  int n = bytesRead / sizeof(int32_t);
-  if (n <= 0)
-    return; // on null sample abort
-
-  // Convert 24 bits → 16 bits for FFT
-  for (int i = 0; i < n; i++)
-  {
-    int16_t val = raw[i] >> 14; // INMP441 outputs 24bits on 32bits
-    vReal[i] = val;
-    vImag[i] = 0;
-  }
-
-  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-  FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();
-
-  // Energy in first crack band
-  double crackEnergy = bandEnergy(vReal, 2000, 8000);
-
-  unsigned long now = millis();
-  if (crackEnergy > energyThreshold && (now - lastCrackTime) > REFRACTORY_MS)
-  {
-    crack_counter++; //
-    lastCrackTime = now;
-    Serial.printf("crack detected! Total = %lu (energy %.2f)\n", crack_counter, crackEnergy);
-  }
-}
-
 void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
 {
   AudioData data;
@@ -263,14 +218,11 @@ void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLECon
   data.crack_count = (!isCalibrated || !audioStarted ? ++crack_counter : count_i);
   // Calculate checksum over the data payload (excluding header and footer)
   // The payload starts right after the header field
-  //const uint8_t *dataPayload = (const uint8_t *)&data + sizeof(data.header);
   const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&data) + sizeof(data.header);
   // Determine the length of the data fields included in the checksum
   size_t payloadLength = sizeof(data.crack_count);
-  //data.checksum = calculateChecksum(dataPayload, payloadLength);
   data.checksum = calculateChecksum(payloadPtr, payloadLength);
   // Set the characteristic value with the entire structure
-  //pCharacteristic->setValue((uint8_t *)&data, sizeof(AudioData));
   pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData)); 
   // Print current values to the Serial Monitor
   Serial.printf("crack counter: %d crack(s)", (float)data.crack_count);
@@ -288,23 +240,16 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
                   rxData.length(), sizeof(AudioCommand));
     return;
   }
-
-  // --- CORRECTION : Utilisation de memcpy pour la désérialisation ---
-  AudioCommand cmd; // Créer une instance locale de la structure
-  // Copier les octets du string dans la structure
+ AudioCommand cmd; // Créer une instance locale de la structure
   memcpy(&cmd, rxData.data(), sizeof(AudioCommand)); 
-  // Maintenant, utilisez 'cmd' comme un objet et non plus comme un pointeur
-
   // Define the payload for checksum calculation
   // Le pointeur pointe vers l'adresse de 'cmd', puis on avance de la taille du header.
-  const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&cmd) + sizeof(cmd.header); 
-  
+  const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&cmd) + sizeof(cmd.header);   
   // Payload length = size of command field
   size_t payloadLength = sizeof(cmd.command);
   // Calculate the expected checksum
   uint8_t calculatedChecksum = calculateChecksum(payloadPtr, payloadLength);
-  
-  // 5. Verify Checksum and Header/Footer for data integrity
+  // Verify Checksum and Header/Footer for data integrity
   if (cmd.header != 0x5555 || cmd.footer != 0xAAAA)
   {
     Serial.printf("WRITE Error: Invalid Header (0x%04X) or Footer (0x%04X)\n", cmd.header, cmd.footer);
@@ -328,31 +273,30 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     if (isCalibrated)
     {
       crackCounterStatus = true;
-      Serial.println("-> Start Sampling/Counting");
-      
+      Serial.println("Audip process - received command to start Sampling/Counting");
     }
     break;
   case COMMAND_STOP_SAMPLING:
     if (isCalibrated)
     {
       crackCounterStatus = false;
-      Serial.println("-> Stopping Sampling/Counting");
+      Serial.println("Audio process - recieved command to stop Sampling/Counting");
     }
     break;
   case COMMAND_CALIBRATIONSTATE:
     if (calibrating)
     {
-      Serial.println("calibration process is currently running ...");
+      Serial.println("Audio process - status request, calibration running, please wait!");
     } else
     if (isCalibrated) {
-      Serial.println("calibration done and OK");
+      Serial.println("Audio process - status request, calibration OK");
     } else
     {
-      Serial.println("calibration not done yet or KO");
+      Serial.println("Audio process - status request, calibration not done yet or KO");
     }
     break;
   default:
-    Serial.printf("-> Warning: Unknown command ID: 0x%04X\n", cmd.command);
+    Serial.printf("-Audio process - status request, Unknown command: 0x%04X\n", cmd.command);
     break;
   }
 }

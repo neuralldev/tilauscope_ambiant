@@ -104,13 +104,13 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 | SDA    | GPIO 21     | Data              |
 | SCL    | GPIO 22     | Clock             |
 
-|NMP441     | ESP32    | Fonction          |
+|NMP441     | ESP32    | Fonction          |           L/R                  GND
 |-----------|----------|-------------------|
-|VDD        | 3.3 V    | Power             |
+|VDD        | 3.3 V    | Power             |           WS                   VDD
 |GND        | GND      | Ground            |
-|WS (LRCL)  | GPIO 13  | Word Select       |
+|WS (LRCL)  | GPIO 13  | Word Select       |           SCK    MICROPHONE     SD
 |SCK (BCLK) | GPIO 14  | Bit Clock         |
-|SD (DOUT)  | GPIO 34  | Data              |
+|SD (DOUT)  | GPIO 34  | Data              |           ------  FACE VIEW ------
 |L/R        | GND      | Left channel only |
 
 [esp32 module](esp32.png)
