@@ -300,7 +300,7 @@ void setup()
       Serial.println("I2S started, listening to INMP441");
     }
   };
-  Serial.println("-> Start Sampling/Counting task");
+  Serial.println("Start Audio Sampling/Counting task");
   crackCounterStatus = true;
   xTaskCreatePinnedToCore(
       monitorAudioTask,   // Task function for audio monitoring, send to a separate thread on a dedicated cpu
@@ -311,7 +311,6 @@ void setup()
       &monitorTaskHandle, // Task handle
       1                   // Core 1 (Recommended for heavy lifting)
   );
-  Serial.println("-> Sampling/Counting task started");
 #endif
 
   Serial.println("initializing BLE");

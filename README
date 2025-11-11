@@ -71,6 +71,7 @@ when writing to the audio characteristic, sending a packet structure can trigger
 | 0x55 0x55 | 00 02       |    nn    | 0xaa 0xaa| ask the probe to stop to detect cracks, the counter is reset to 0        |
 
 (the first byte is 0x00 and reserved for future use)
+note : write to GATT requires to ask for response (response=True) if awaited
 
 ### Operation & Status Indicators
 
@@ -127,4 +128,5 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 | ambiant         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05` |
 | audio           | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c04` |
 
-The **service** UUID is used only for advertising. data exchange is done using the **data** UUID. At the moment data only accept READ to query for value. the payload is returned and must be unpacked.
+The **service** UUID is used only for advertising. 
+data exchange is done using the **data** UUID. At the moment data only accept READ to query for value. the payload is returned and must be unpacked.

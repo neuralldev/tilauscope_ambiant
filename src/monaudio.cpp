@@ -240,15 +240,19 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
                   rxData.length(), sizeof(AudioCommand));
     return;
   }
- AudioCommand cmd; // Créer une instance locale de la structure
+  AudioCommand cmd; // Créer une instance locale de la structure
   memcpy(&cmd, rxData.data(), sizeof(AudioCommand)); 
+//  Serial.println("debug - command copied");
   // Define the payload for checksum calculation
   // Le pointeur pointe vers l'adresse de 'cmd', puis on avance de la taille du header.
   const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&cmd) + sizeof(cmd.header);   
+//  Serial.println("debug - payload unpacked");
   // Payload length = size of command field
   size_t payloadLength = sizeof(cmd.command);
   // Calculate the expected checksum
   uint8_t calculatedChecksum = calculateChecksum(payloadPtr, payloadLength);
+//  Serial.println("debug - checksum calculated");
+
   // Verify Checksum and Header/Footer for data integrity
   if (cmd.header != 0x5555 || cmd.footer != 0xAAAA)
   {
@@ -261,7 +265,7 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     return;
   }
   // Checksum is valid! Unpack and execute the command
-  Serial.printf("WRITE Success! Valid Command Received: 0x%04X\n", cmd.command);
+  //Serial.printf("WRITE Success! Valid Command Received: 0x%04X\n", cmd.command);
   switch (cmd.command)
   {
   case COMMAND_RUNCALIBRATION:
