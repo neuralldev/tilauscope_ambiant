@@ -374,8 +374,6 @@ void setup()
   Serial.println(">>-------------------------------------------------------------------------------------");
 }
 
-// to test /Users/thierrygluzman/Documents/Dev/btitop/.venv/bin/python /Users/thierrygluzman/Documents/Dev/btitop/scan_bluetooth.py
-
 // --- Loop ---
 void loop()
 {
@@ -392,34 +390,10 @@ void loop()
       int ledState = digitalRead(LED_PIN);
       digitalWrite(LED_PIN, !ledState);
     }
-    if (currentMillis - previousMillis >= 10*BLINK_INTERVAL)
-      if (pAdvertising->isAdvertising())
-        Serial.println("advertising on");
-      else
-        Serial.println("advertising off");
   }
   else
   {
     // A device is connected: keep the LED ON steadily
     digitalWrite(LED_PIN, HIGH);
   } 
- /*if (currentMillis - previousMillis1 >= 5000) {
-    previousMillis1 = currentMillis;
-    bme_temp->getEvent(&temp_event);
-    bme_pressure->getEvent(&pressure_event);
-    bme_humidity->getEvent(&humidity_event);
-    
-    Serial.print(F("Temperature = "));
-    Serial.print(temp_event.temperature);
-    Serial.println(" *C");
-
-    Serial.print(F("Humidity = "));
-    Serial.print(humidity_event.relative_humidity);
-    Serial.println(" %");
-
-    Serial.print(F("Pressure = "));
-    Serial.print(pressure_event.pressure);
-    Serial.println(" hPa");
-    Serial.println();
-  }  */
 }
