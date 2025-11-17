@@ -12,6 +12,13 @@
 #include "common.h"
 #include "monaudio.h"
 
+//#define START_BLE
+#if not defined(START_BLE)
+// Variables de contrôle
+long last_print_time = 0;
+const long PRINT_INTERVAL = 1000; // Affichage toutes les 1000 ms (1 seconde)
+#endif
+
 // --- Definitions ---
 // Standard atmospheric pressure at sea level in hPa (used for altitude calculation)
 #define SEALEVELPRESSURE_HPA (1013.25)
@@ -35,6 +42,7 @@ bool deviceConnected = false;
 unsigned long previousMillis  = 0; // For non-blocking timing (LED blink)
 unsigned long previousMillis1 = 0; // For non-blocking tempo display
 int simulation = false;           // Flag to indicate if simulation mode is active (sensor failure)
+bool previous = true;             //used in test mode only
 
 Adafruit_Sensor *bme_temp;
 Adafruit_Sensor *bme_pressure;
@@ -264,10 +272,9 @@ void setup()
   i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = I2S_SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,     // read on 32 bits, 24 bits are available
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,      // microphone is mono and sends data on left channel
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = 0,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // <-- Assurer 32 bits
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,  // ou ONLY_RIGHT selon votre L/R pin
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      .intr_alloc_flags = 0,
       .dma_buf_count = 8,
       .dma_buf_len = 256,
       .use_apll = false,
@@ -275,7 +282,7 @@ void setup()
       .fixed_mclk = 0};
 
   i2s_pin_config_t pin_config = {           // change pin settings in .H header file if necessary (13,14,34)
-      .bck_io_num = I2S_BCK_PIN,
+      .bck_io_num = I2S_SCK_PIN,
       .ws_io_num = I2S_WS_PIN,
       .data_out_num = I2S_PIN_NO_CHANGE,
       .data_in_num = I2S_SD_PIN};
@@ -300,12 +307,19 @@ void setup()
       Serial.println("I2S started, listening to INMP441");
     }
   };
+#if not defined(START_BLE) 
+  if (audioStarted) {
+    // Le mode test noble ne lance pas la calibration. Nous devons le faire ici.
+      Serial.println("Launching manual calibration for noble mode");
+      TestAudio(COMMAND_RUNCALIBRATION); // Lancer la fonction calibrate() qui crée calibrateTask
+  }
+#endif
   Serial.println("Start Audio Sampling/Counting task");
   crackCounterStatus = true;
   xTaskCreatePinnedToCore(
       monitorAudioTask,   // Task function for audio monitoring, send to a separate thread on a dedicated cpu
       "MonitorAudioTask", // Name
-      8192,               // Stack size (increased for FFT use)
+      12288,               // Stack size (increased for FFT use)
       NULL,               // Parameter
       2,                  // Priority (to calibrate)
       &monitorTaskHandle, // Task handle
@@ -313,6 +327,7 @@ void setup()
   );
 #endif
 
+#if defined(START_BLE)
   Serial.println("initializing BLE");
   // Initialize the Device and Server
   bool initerr = NimBLEDevice::init(finalDeviceName);
@@ -371,11 +386,17 @@ void setup()
   }
   Serial.printf("TilauScope Ambiant BLE service now fully ready, answer on nName: %s\n", finalDeviceName.c_str());
   Serial.println(">>-------------------------------------------------------------------------------------");
+#else 
+  Serial.println("started in noble mode for test");
+  previous = true;
+#endif
+
 }
 
 // --- Loop ---
 void loop()
 {
+#if defined(START_BLE)
   // LED Blinking Management (Non-blocking)
   unsigned long currentMillis = millis();
   if (!deviceConnected)
@@ -395,4 +416,20 @@ void loop()
     // A device is connected: keep the LED ON steadily
     digitalWrite(LED_PIN, HIGH);
   } 
+#else
+  // Lire toutes les secondes
+  if (millis() - last_print_time >= PRINT_INTERVAL) {
+    
+    if (TestAudio(COMMAND_CALIBRATIONSTATE)==1) {
+      // calibration finished
+      if (TestAudio(COMMAND_SAMPLINGSTATUS)!=1)
+          TestAudio(COMMAND_START_SAMPLING);
+      else {
+        Serial.printf("current crack counter = %d\n", TestAudio(COMMAND_GETCRACKCOUNTER));
+      }
+    }
+
+    last_print_time = millis();
+  }
+#endif
 }

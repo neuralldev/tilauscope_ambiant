@@ -100,18 +100,18 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 
 | BME280 | ESP32 WROOM | Fonction          |
 |--------|-------------|-------------------|
-| VCC    | 3.3V        | Power             |
+| VCC    | 3.3V -5V    | Power             |
 | GND    | GND         | Ground            |
 | SDA    | GPIO 21     | Data              |
 | SCL    | GPIO 22     | Clock             |
 
-|NMP441     | ESP32    | Fonction          |           L/R                  GND
+|NMP441     | ESP32    | Fonction          |       Vert     L/R                   GND  Marron
 |-----------|----------|-------------------|
-|VDD        | 3.3 V    | Power             |           WS                   VDD
+|VDD        | 3.3 V    | Power             |       Jaune     WS                   VDD  Rouge
 |GND        | GND      | Ground            |
-|WS (LRCL)  | GPIO 13  | Word Select       |           SCK    MICROPHONE     SD
-|SCK (BCLK) | GPIO 14  | Bit Clock         |
-|SD (DOUT)  | GPIO 34  | Data              |           ------  FACE VIEW ------
+|WS (LRCL)  | GPIO 10  | Word Select       |       Orange    SCK    MICROPHONE     SD  Noir
+|SCK (BCLK) | GPIO 11  | Bit Clock         |
+|SD (DOUT)  | GPIO 25  | Data              |               ------  FACE VIEW ------
 |L/R        | GND      | Left channel only |
 
 [esp32 module](esp32.png)

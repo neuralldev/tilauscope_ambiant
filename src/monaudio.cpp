@@ -3,6 +3,8 @@
 #include <Wire.h>
 #include "common.h"
 
+#define TESTMODE
+
 /*
 Brochage typique INMP441 ↔ ESP32
 INMP441	    ESP32	    Fonction
@@ -44,11 +46,6 @@ typedef struct __attribute__((packed))
   uint8_t checksum;         // Simple additive checksum for integrity
   uint16_t footer = 0xAAAA; // End of message footer
 } AudioData;
-
-#define COMMAND_RUNCALIBRATION 0x0000
-#define COMMAND_START_SAMPLING 0x0001
-#define COMMAND_STOP_SAMPLING 0x0002
-#define COMMAND_CALIBRATIONSTATE 0x0003
 
 typedef struct __attribute__((packed))
 {
@@ -99,7 +96,7 @@ void calibrateTask(void *pvParameters)
             FFT.compute(FFTDirection::Forward);
             FFT.complexToMagnitude();
 
-            double e = bandEnergy(vReal, 300, 2000);
+            double e = bandEnergy(vReal, 4500, 8000);
             accumEnergy += e;
             accumSq += e * e;
             count++;
@@ -118,7 +115,7 @@ void calibrateTask(void *pvParameters)
         noiseMean = accumEnergy / count;
         noiseStd = sqrt((accumSq / count) - (noiseMean * noiseMean));
         energyThreshold = noiseMean + 3 * noiseStd;
-        Serial.printf("Audio process - calibration is done: average noise = %.2f | treshold = %.2f\n", noiseMean, energyThreshold);
+        Serial.printf("Audio process - calibration is done on %d packets : average noise = %.2f | treshold = %.2f\n", count, noiseMean, energyThreshold);
         crack_counter = 0; // reset crack counter
         bIsCalibrated = true; // set flag to allow to unlock audio features
     }
@@ -145,7 +142,7 @@ void calibrate()
   xTaskCreatePinnedToCore(
       calibrateTask,          // Task function
       "CalibrateTask",        // Name for the task
-      4096,                   // Stack size (increase if needed)
+      12288,                   // Stack size (increase if needed)
       NULL,                   // Parameter to pass
       1,                      // Priority (1 is usually fine)
       &calibrateTaskHandle,   // Task handle (for referencing)
@@ -187,8 +184,8 @@ void monitorAudioTask(void *pvParameters)
                     FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
                     FFT.compute(FFTDirection::Forward);
                     FFT.complexToMagnitude();
-
-                    double crackEnergy = bandEnergy(vReal, 2000, 8000);
+/*
+                    double crackEnergy = bandEnergy(vReal, 4500, 8000);
 
                     unsigned long now = millis();
                     if (crackEnergy > energyThreshold && (now - lastCrackTime) > REFRACTORY_MS)
@@ -198,8 +195,37 @@ void monitorAudioTask(void *pvParameters)
                         crack_counter++; 
                         lastCrackTime = now;
                         Serial.printf("Audio process - Monitoring - crack detected! count=%d (energy %.2f)\n", crack_counter, crackEnergy);
+                    }*/
+
+             // 1. Calculer l'énergie de la bande CRACK (Haute Fréquence)
+                    double highEnergy = bandEnergy(vReal, 4500, 8000); 
+
+                    // 2. Calculer l'énergie de la bande BRUIT (Basse Fréquence)
+                    // Élargissement de la bande pour capturer plus de bruit de fond stable (e.g., 200 Hz à 2000 Hz)
+                    double lowEnergy = bandEnergy(vReal, 200, 2000); // 300, 1500 -> 200, 2000
+
+                    // 3. Calculer le Ratio
+                    double ratio = 0.0;
+                    // Garde-fou : Le dénominateur doit être suffisant pour éviter une division erronée
+                    if (lowEnergy > 5000.0) { // Augmenté pour garantir un dénominateur stable et significatif
+                        ratio = highEnergy / lowEnergy;
                     }
-                }
+
+                    unsigned long now = millis();
+                    
+                    const double MIN_CRACK_ENERGY_GATE = 5000.0; // Garde-fou de l'énergie (peu probable d'être le problème)
+                    const double MIN_RATIO_THRESHOLD = 1.61;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
+
+                    if (highEnergy > MIN_CRACK_ENERGY_GATE && 
+                        ratio > MIN_RATIO_THRESHOLD && 
+                        (now - lastCrackTime) > REFRACTORY_MS)
+                    {
+                        crack_counter++; 
+                        lastCrackTime = now;
+                        Serial.printf("Audio process - Monitoring - crack detected! count=%d (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", 
+                                      crack_counter, highEnergy, lowEnergy, ratio);
+                    }
+                  }
             }
         }
         else 
@@ -335,3 +361,68 @@ void AudioDataCallbacks::onSubscribe(NimBLECharacteristic *pCharacteristic, NimB
   str += std::string(pCharacteristic->getUUID());
   Serial.printf("%s\n", str.c_str());
 }
+
+#if defined(TESTMODE)
+int TestAudio(int m) {
+  switch (m)
+  {
+  case COMMAND_RUNCALIBRATION:
+    crackCounterStatus = false; // Example use of a global state variable
+    crack_counter = 0;
+    calibrate();
+    return 1;
+  case COMMAND_START_SAMPLING:
+    if (isCalibrated)
+    {
+      crackCounterStatus = true;
+      Serial.println("Audip process - received command to start Sampling/Counting");
+      return 1;
+    }
+    break;
+  case COMMAND_STOP_SAMPLING:
+    if (isCalibrated)
+    {
+      crackCounterStatus = false;
+      Serial.println("Audio process - recieved command to stop Sampling/Counting");
+      return 1;
+    }
+    break;
+  case COMMAND_CALIBRATIONSTATE:
+    if (calibrating)
+    {
+      Serial.println("Audio process - status request, calibration running, please wait!");
+      return 0;
+    } else
+    if (isCalibrated) {
+      //Serial.println("Audio process - status request, calibration OK");
+      return 1;
+    } else
+    {
+      //Serial.println("Audio process - status request, calibration not done yet or KO");
+      return 0;
+    }
+    break;
+  case COMMAND_SAMPLINGSTATUS:
+    if (calibrating)
+      return 0;
+    else
+      if (isCalibrated) 
+        return (crackCounterStatus?1:0);
+      else
+        return 0;
+  case COMMAND_GETCRACKCOUNTER:
+    if (calibrating)
+      return -1;
+    else
+      if (isCalibrated) 
+        if (crackCounterStatus)
+          return crack_counter;
+        else
+          return -1;
+  default:
+    Serial.printf("-Audio process - status request, Unknown command: 0x%04X\n", m);
+    break;
+  }
+    return 0;
+}
+#endif
