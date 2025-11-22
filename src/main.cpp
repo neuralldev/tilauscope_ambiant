@@ -12,7 +12,7 @@
 #include "common.h"
 #include "monaudio.h"
 
-//#define START_BLE
+#define START_BLE
 #if not defined(START_BLE)
 // Variables de contrôle
 long last_print_time = 0;

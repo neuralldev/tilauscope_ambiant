@@ -239,9 +239,8 @@ void monitorAudioTask(void *pvParameters)
 void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
 {
   AudioData data;
-  float count_i = 0;
   // Read or simulate data
-  data.crack_count = (!isCalibrated || !audioStarted ? ++crack_counter : count_i);
+  data.crack_count = (!isCalibrated || !audioStarted ? 0 : crack_counter);
   // Calculate checksum over the data payload (excluding header and footer)
   // The payload starts right after the header field
   const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&data) + sizeof(data.header);
@@ -251,7 +250,7 @@ void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLECon
   // Set the characteristic value with the entire structure
   pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData)); 
   // Print current values to the Serial Monitor
-  Serial.printf("crack counter: %d crack(s)", (float)data.crack_count);
+  Serial.printf("on read received - crack counter: %d crack(s)", (float)data.crack_count);
 }
 
 void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) 
