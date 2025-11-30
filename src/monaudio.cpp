@@ -250,7 +250,7 @@ void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLECon
   // Set the characteristic value with the entire structure
   pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData)); 
   // Print current values to the Serial Monitor
-  Serial.printf("on read received - crack counter: %d crack(s)", (float)data.crack_count);
+  Serial.printf("on read received - crack counter: %d crack(s)\n", (float)data.crack_count);
 }
 
 void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) 
