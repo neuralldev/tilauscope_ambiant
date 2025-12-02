@@ -31,6 +31,12 @@ unsigned long lastCrackTime = 0; // last timestamp a crack is detected
 float energyThreshold = 0.0F;
 float noiseMean = 0, noiseStd = 0;
 uint32_t totalCracks = 0;
+int bandEnergyMin = 4500;
+int bandEnergyMax = 8000;
+int low_bandEnergyMin = 200;
+int low_bandEnergyMax = 2000;
+float lowEnergyGate = 5000;
+float energycoeff = 1.6;
 
 // Global handle for the calibration task
 TaskHandle_t calibrateTaskHandle = NULL;
@@ -96,7 +102,7 @@ void calibrateTask(void *pvParameters)
             FFT.compute(FFTDirection::Forward);
             FFT.complexToMagnitude();
 
-            double e = bandEnergy(vReal, 4500, 8000);
+            double e = bandEnergy(vReal, bandEnergyMin, bandEnergyMax);
             accumEnergy += e;
             accumSq += e * e;
             count++;
@@ -184,25 +190,13 @@ void monitorAudioTask(void *pvParameters)
                     FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
                     FFT.compute(FFTDirection::Forward);
                     FFT.complexToMagnitude();
-/*
-                    double crackEnergy = bandEnergy(vReal, 4500, 8000);
 
-                    unsigned long now = millis();
-                    if (crackEnergy > energyThreshold && (now - lastCrackTime) > REFRACTORY_MS)
-                    {
-                        // Use a critical section if crack_counter is modified elsewhere 
-                        // (though in this design, it's mostly modified here and read in BLE callback)
-                        crack_counter++; 
-                        lastCrackTime = now;
-                        Serial.printf("Audio process - Monitoring - crack detected! count=%d (energy %.2f)\n", crack_counter, crackEnergy);
-                    }*/
-
-             // 1. Calculer l'énergie de la bande CRACK (Haute Fréquence)
-                    double highEnergy = bandEnergy(vReal, 4500, 8000); 
+                    // 1. Calculer l'énergie de la bande CRACK (Haute Fréquence)
+                    double highEnergy = bandEnergy(vReal, bandEnergyMin, bandEnergyMax); 
 
                     // 2. Calculer l'énergie de la bande BRUIT (Basse Fréquence)
                     // Élargissement de la bande pour capturer plus de bruit de fond stable (e.g., 200 Hz à 2000 Hz)
-                    double lowEnergy = bandEnergy(vReal, 200, 2000); // 300, 1500 -> 200, 2000
+                    double lowEnergy = bandEnergy(vReal, low_bandEnergyMin, low_bandEnergyMax); // 300, 1500 -> 200, 2000
 
                     // 3. Calculer le Ratio
                     double ratio = 0.0;
@@ -213,16 +207,17 @@ void monitorAudioTask(void *pvParameters)
 
                     unsigned long now = millis();
                     
-                    const double MIN_CRACK_ENERGY_GATE = 5000.0; // Garde-fou de l'énergie (peu probable d'être le problème)
-                    const double MIN_RATIO_THRESHOLD = 1.61;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
-
+                    const double MIN_CRACK_ENERGY_GATE = lowEnergyGate; // Garde-fou de l'énergie
+                    const double MIN_RATIO_THRESHOLD = energycoeff;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
+                    //if (ratio > 0)
+                    Serial.printf("Audio process - mon - (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", highEnergy, lowEnergy, ratio);
                     if (highEnergy > MIN_CRACK_ENERGY_GATE && 
                         ratio > MIN_RATIO_THRESHOLD && 
-                        (now - lastCrackTime) > REFRACTORY_MS)
+                        (now - lastCrackTime) > REFRACTORY_MS) // 150ms
                     {
                         crack_counter++; 
                         lastCrackTime = now;
-                        Serial.printf("Audio process - Monitoring - crack detected! count=%d (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", 
+                        Serial.printf("Audio process - mon - crack detected! count=%d (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", 
                                       crack_counter, highEnergy, lowEnergy, ratio);
                     }
                   }
