@@ -69,6 +69,15 @@ when writing to the audio characteristic, sending a packet structure can trigger
 | 0x55 0x55 | 00 01       |    nn    | 0xaa 0xaa| ask the probe to start to detect cracks, the counter is incremented      |
 |-----------|-------------|----------|----------|--------------------------------------------------------------------------|
 | 0x55 0x55 | 00 02       |    nn    | 0xaa 0xaa| ask the probe to stop to detect cracks, the counter is reset to 0        |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 00 06       |    nn    | 0xaa 0xaa| raise ratio of detection by 0.1                                          |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 00 07       |    nn    | 0xaa 0xaa| decrease ratio of detection by 0.1                                       |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 05 06       |    nn    | 0xaa 0xaa| raise ratio of detection by 0.5                                          |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| 0x55 0x55 | 05 07       |    nn    | 0xaa 0xaa| decrease ratio of detection by 0.5                                       |
+|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
 
 (the first byte is 0x00 and reserved for future use)
 note : write to GATT requires to ask for response (response=True) if awaited

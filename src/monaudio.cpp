@@ -35,8 +35,8 @@ int bandEnergyMin = 4500;
 int bandEnergyMax = 8000;
 int low_bandEnergyMin = 200;
 int low_bandEnergyMax = 2000;
-float lowEnergyGate = 5000;
-float energycoeff = 1.6;
+float lowEnergyGate = 35000.0; // <-- AUGMENTÉ : Seuil absolu au-dessus du bruit moyen (~21000)
+float energycoeff = 1.70;      // <-- AUGMENTÉ : Ratio minimal pour être un crack (avant à 1.6)
 
 // Global handle for the calibration task
 TaskHandle_t calibrateTaskHandle = NULL;
@@ -413,6 +413,22 @@ int TestAudio(int m) {
           return crack_counter;
         else
           return -1;
+  case COMMAND_RAISERATIO:
+    energycoeff += 0.1;
+    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
+    return 1;
+  case COMMAND_DECREASERATIO:
+    energycoeff -= 0.1;
+    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
+    return 1;
+  case COMMAND_RAISERATIO5:
+    energycoeff += 0.5;
+    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
+    return 1;
+  case COMMAND_DECREASERATIO5:
+    energycoeff -= 0.1;
+    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
+    return 1;
   default:
     Serial.printf("-Audio process - status request, Unknown command: 0x%04X\n", m);
     break;
