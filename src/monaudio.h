@@ -4,10 +4,19 @@
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
 
+#include <FS.h> 
+#include <LittleFS.h> 
+
+#define FILE_SYSTEM LittleFS 
+
+#include <ArduinoJson.h>
+
 #pragma once
 #include <NimBLEDevice.h>
 
 # if defined(TILAUONAUDIO_H)
+
+#define CALIBRATION_FILE "/audio_calib.json"
 
 #define BUFFER_SIZE       1024
 #define REFRACTORY_MS     150
@@ -50,6 +59,9 @@ int TestAudio(int m);
 extern bool crackCounterStatus; // true = running, false = not running
 extern bool isCalibrated;    // true = calibration has been done and finished ok, false=calibraton not done, skip counting
 extern bool audioStarted;       // true = audio correctly initialized, false = not initialized, therefore no feature working
+
+bool saveCalibrationToFile();
+bool loadCalibrationFromFile();
 
 # endif
 

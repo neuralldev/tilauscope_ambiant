@@ -130,6 +130,11 @@ void calibrateTask(void *pvParameters)
     calibrating = false;
     calibrateTaskHandle = NULL; // Clear the handle
     isCalibrated = bIsCalibrated;  // avoid that monitor starts before all the other parameters are set
+
+    if (isCalibrated) {
+        saveCalibrationToFile(); // Sauvegarder les nouveaux paramètres
+    }
+
     vTaskDelete(NULL);          // Delete the current task
 }
 
@@ -354,6 +359,85 @@ void AudioDataCallbacks::onSubscribe(NimBLECharacteristic *pCharacteristic, NimB
   }
   str += std::string(pCharacteristic->getUUID());
   Serial.printf("%s\n", str.c_str());
+}
+
+/**
+ * @brief Sauvegarde les paramètres de calibration (noiseMean, noiseStd, energyThreshold, energycoeff) dans un fichier JSON.
+ * @return true si la sauvegarde a réussi, false sinon.
+ */
+bool saveCalibrationToFile() {
+    // La taille du document dépend de vos données. 
+    // Pour 4 float (4x8=32 octets) + clés + surcoût, 128 octets sont largement suffisants.
+    JsonDocument doc;
+
+    doc["noiseMean"] = noiseMean;
+    doc["noiseStd"] = noiseStd;
+    doc["energyThreshold"] = energyThreshold;
+    doc["energycoeff"] = energycoeff;
+    doc["isCalibrated"] = true; // Sauvegarder l'état de calibration
+
+    Serial.printf("Audio process - Saving calibration to %s...\n", CALIBRATION_FILE);
+
+    File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_WRITE);
+    if (!file) {
+        Serial.println("Audio process - Failed to open file for writing!");
+        return false;
+    }
+
+    if (serializeJson(doc, file) == 0) {
+        Serial.println("Audio process - Failed to write to file!");
+        file.close();
+        return false;
+    }
+    
+    file.close();
+    Serial.println("Audio process - Calibration saved successfully.");
+    return true;
+}
+
+/**
+ * @brief Charge les paramètres de calibration à partir du fichier JSON.
+ * @return true si le chargement a réussi et les paramètres sont valides, false sinon.
+ */
+bool loadCalibrationFromFile() {
+    if (!FILE_SYSTEM.exists(CALIBRATION_FILE)) {
+        Serial.println("Audio process - Calibration file not found.");
+        return false;
+    }
+
+    File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_READ);
+    if (!file) {
+        Serial.println("Audio process - Failed to open calibration file for reading.");
+        return false;
+    }
+
+    JsonDocument doc;
+
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+
+    if (error) {
+        Serial.printf("Audio process - Failed to read file, error: %s\n", error.c_str());
+        return false;
+    }
+
+    // Vérification de la présence des clés
+    if (!doc["noiseMean"] || !doc["isCalibrated"]) {
+        Serial.println("Audio process - Calibration file is incomplete or invalid.");
+        return false;
+    }
+    
+    // Assignation des valeurs globales
+    noiseMean = doc["noiseMean"].as<float>();
+    noiseStd = doc["noiseStd"].as<float>();
+    energyThreshold = doc["energyThreshold"].as<float>();
+    energycoeff = doc["energycoeff"].as<float>();
+    isCalibrated = doc["isCalibrated"].as<bool>();
+    
+    Serial.printf("Audio process - Calibration loaded from file: Mean=%.2f, Threshold=%.2f, Ratio=%.2f\n", 
+                  noiseMean, energyThreshold, energycoeff);
+    
+    return isCalibrated; // Retourne l'état de calibration chargé
 }
 
 #if defined(TESTMODE)
