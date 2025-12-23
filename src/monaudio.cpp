@@ -212,18 +212,17 @@ void monitorAudioTask(void *pvParameters)
 
                     unsigned long now = millis();
                     
-                    const double MIN_CRACK_ENERGY_GATE = lowEnergyGate; // Garde-fou de l'énergie
-                    const double MIN_RATIO_THRESHOLD = energycoeff;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
+//                    const double MIN_CRACK_ENERGY_GATE = lowEnergyGate; // Garde-fou de l'énergie
+//                    const double MIN_RATIO_THRESHOLD = energycoeff;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
                     //if (ratio > 0)
-                    Serial.printf("Audio process - mon - (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", highEnergy, lowEnergy, ratio);
-                    if (highEnergy > MIN_CRACK_ENERGY_GATE && 
-                        ratio > MIN_RATIO_THRESHOLD && 
+                    Serial.printf("- mon - H=%.2f L=%.2f R=%.2f\n", highEnergy, lowEnergy, ratio);
+                    if (highEnergy > lowEnergyGate && 
+                        ratio > energycoeff && 
                         (now - lastCrackTime) > REFRACTORY_MS) // 150ms
                     {
                         crack_counter++; 
                         lastCrackTime = now;
-                        Serial.printf("Audio process - mon - crack detected! count=%d (E_high: %.2f / E_low: %.2f / Ratio: %.2f)\n", 
-                                      crack_counter, highEnergy, lowEnergy, ratio);
+                        Serial.printf("- mon - crack detected! count=%d \n", crack_counter);
                     }
                   }
             }
@@ -302,14 +301,14 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     if (isCalibrated)
     {
       crackCounterStatus = true;
-      Serial.println("Audip process - received command to start Sampling/Counting");
+      Serial.println("Audip process - start Sampling/Counting");
     }
     break;
   case COMMAND_STOP_SAMPLING:
     if (isCalibrated)
     {
       crackCounterStatus = false;
-      Serial.println("Audio process - recieved command to stop Sampling/Counting");
+      Serial.println("Audio process - stop Sampling/Counting");
     }
     break;
   case COMMAND_CALIBRATIONSTATE:
@@ -325,7 +324,7 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     }
     break;
   default:
-    Serial.printf("-Audio process - status request, Unknown command: 0x%04X\n", cmd.command);
+    Serial.printf("-Audio process - Unknown command: 0x%04X\n", cmd.command);
     break;
   }
 }
