@@ -2,8 +2,15 @@
 .vscode/
 *.pyc
 __pycache__/
-test
 compile*.json
 .DS_Code
 *.dblite
 *.json
+.vscode/*
+*.code-workspace
+# OS junk
+.DS_Store
+Thumbs.db
+test
+test/*
+test/README
