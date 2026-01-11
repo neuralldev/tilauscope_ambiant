@@ -28,14 +28,24 @@ The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy
 
 This project is built for the Arduino IDE or PlatformIO targeting the ESP32.
 
+## How to flash
+
+Flash using any utility. It must be done with SPI DIO Mode, not QIO. bootloader must be flashed first, then reset the module it will put itself in flashing mode and flash partitiontable, reboot it again and firmware.bin. 
+
+| File.                | Adres       |
+| -------------------- | ----------- |
+| `bootloader.bin`     | **0x1000**  |
+| `partitiontable.bin` | **0x8000**  |
+| `firmware.bin`       | **0x10000** |
+
 ### Required Librarie
 
-Install the following libraries via the Arduino Library Manager or PlatformIO Registry:
+To work on the code, Install the following libraries via the Arduino Library Manager or PlatformIO Registry:
 
-NimBLE-Arduino (or ESP32 BLE Library): For the Bluetooth Low Energy stack.
-Adafruit BME280 Library
-Adafruit Unified Sensor Library
-arduinoFFT Library
+- NimBLE-Arduino (or ESP32 BLE Library): For the Bluetooth Low Energy stack.
+- Adafruit BME280 Library
+- Adafruit Unified Sensor Library
+- arduinoFFT Library
 
 ### Data Structure and Format
 
@@ -61,8 +71,8 @@ Audio payload to retrieve contains the actual crack counter when you read the au
 
 when writing to the audio characteristic, sending a packet structure can trigger the crack counter logic:
 
-| HEADER    | crack count | checksum | footer   | function                                                                 |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
+| HEADER    | crack count | checksum | footer   |function                                                                  |
+|-----------|-------------|----------|-------------------------------------------------------------------------------------|
 | 0x55 0x55 | 00 00       |    nn    | 0xaa 0xaa| Run calibration. the process last after 30 seconds                       |
 |                                               | function 1 and 2 are ignored until calibration has been successfully run |
 |-----------|-------------|----------|----------|--------------------------------------------------------------------------|
@@ -95,6 +105,8 @@ to operate, use the following:
 - at DE+1mn call START DETECTION (function 1) writing to Audio UUID
 - at DROP call STOP DETECTION (function 2) writing to Audio UUID
 
+calibration is stored in a file on the esp32 file system. when the probe start, it is loading any previous saved calibration to save this stage if the roast is going to be done in the same conditions (microphone placement, roaster at the same place, exhaust system at the same distance). we encourage you to take note of exact placement of devices because of the nature of waves propagation that can change a lot when shifting a device from a few centimeters. calibration last for 30 seconds or so, when trying to find the right place, monitor your serial port to see signal shape and intensity detected. there are a lot of debug messages with graphical view to help you fine tune the better position.
+
 ## Simulation Mode
 
 If the device fails to initialize the BME280 sensor (e.g., wiring error or sensor not present), it will automatically switch to Simulation Mode.
@@ -112,13 +124,13 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 | VCC    | 3.3V -5V    | Power             |
 | GND    | GND         | Ground            |
 | SDA    | GPIO 21     | Data              |
-| SCL    | GPIO 22     | Clock             |
+| SCL    | GPIO 22     | Clock             |       Example of cabling for microphone and proposed color coding for cable 
 
-|NMP441     | ESP32    | Fonction          |       Vert     L/R                   GND  Marron
+|NMP441     | ESP32    | Fonction          |       Green    L/R                   GND  Brown
 |-----------|----------|-------------------|
-|VDD        | 3.3 V    | Power             |       Jaune     WS                   VDD  Rouge
+|VDD        | 3.3 V    | Power             |       Yellow    WS                   VDD  Red
 |GND        | GND      | Ground            |
-|WS (LRCL)  | GPIO 10  | Word Select       |       Orange    SCK    MICROPHONE     SD  Noir
+|WS (LRCL)  | GPIO 10  | Word Select       |       Orange    SCK    MICROPHONE     SD  Black
 |SCK (BCLK) | GPIO 11  | Bit Clock         |
 |SD (DOUT)  | GPIO 25  | Data              |               ------  FACE VIEW ------
 |L/R        | GND      | Left channel only |
@@ -139,3 +151,86 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 
 The **service** UUID is used only for advertising. 
 data exchange is done using the **data** UUID. At the moment data only accept READ to query for value. the payload is returned and must be unpacked.
+
+## explanation on Audio-Based First Crack Detection: Algorithm Overview
+
+1. Problem Context
+
+During coffee roasting, first crack (FC) is a critical thermophysical event corresponding to rapid water vapor expansion and structural fracturing of the bean. Acoustically, it manifests as short, high-energy impulsive sounds (sharp “pops”) embedded in a background of continuous noise generated by the roaster (drum rotation, airflow, burner, cooling fan).
+
+The objective of the algorithm is to reliably detect the onset of first crack in real time using a microphone, despite a noisy and thermally harsh environment, and to do so with low latency suitable for roast control.
+
+The raw audio signal undergoes several preprocessing steps: 
+
+    - Band-pass filtering
+    First crack energy is concentrated in the mid-to-high frequency range (typically ~1–6 kHz).
+    Low-frequency components (drum rotation, airflow rumble) and very high-frequency noise are attenuated.
+
+    - Framing and windowing
+    Audio is processed in short, overlapping frames (e.g. 10–50 ms).
+    This allows time-localized analysis of impulsive events.
+
+    - Amplitude normalization / AGC (optional)
+    Compensates for gradual changes in overall noise level as airflow or burner power changes.
+
+For each audio frame, the algorithm computes features that emphasize impulsive, crack-like events:
+
+    - Short-Time Energy (STE)
+    Measures sudden bursts of acoustic energy.
+
+    - Spectral representation
+    Captures rapid changes in the frequency spectrum, characteristic of cracks.
+
+    - Zero-Crossing Rate (ZCR)
+    Higher for sharp transient signals than for steady mechanical noise.
+
+    - High-frequency energy ratio
+    Ratio of energy above a given frequency threshold versus total energy.
+
+The core detection mechanism combines thresholding and temporal validation:
+
+    - Adaptive thresholding
+    Thresholds are not fixed.
+    A rolling baseline is computed from recent frames to model current background noise.
+    A frame is marked as a candidate crack if one or more features exceed the baseline by a defined margin.
+
+    - Impulse validation
+    Candidate events must be:
+    Short in duration
+    Isolated (not sustained noise)
+
+    - Spectrally consistent with crack signatures
+    Burst detection
+    First crack is not a single event but the start of a statistically significant increase in crack rate.
+    The algorithm tracks crack counts over a sliding time window.
+    First crack is declared when the event density exceeds a minimum rate for a sustained period (e.g. several cracks within a few seconds).
+
+In practice, the detector is implemented as a state machine:
+
+    - Idle / Pre-FC
+    Monitoring noise baseline; isolated pops ignored.
+
+    - FC Candidate
+    Increased impulsive activity detected; waiting for confirmation.
+
+    - First Crack Confirmed
+    Crack rate exceeds threshold; timestamp is latched and reported.
+
+Once first crack is detected:
+
+    - A timestamp (relative or absolute) is generated.
+    The event can be:
+        Logged for roast profiling
+        Sent via serial, MQTT, or REST to a roast controller
+        Used to trigger automated roast phase transitions (e.g. power or airflow changes)
+    - The algorithm is typically implemented in:
+    C++ for embedded or low-latency systems
+    Python for prototyping, visualization, and offline validation
+
+Key Challenges and Limitations
+    - Acoustic variability between roasters and microphone placements
+    - Overlapping noise from cooling fans or exhaust systems
+    - Second crack overlap in darker roasts
+    - Need for per-machine calibration
+
+As a result, most practical systems rely on tunable parameters rather than fully generic models.

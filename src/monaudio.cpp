@@ -3,7 +3,7 @@
 #include <Wire.h>
 #include "common.h"
 
-#define TESTMODE
+//#define TESTMODE
 
 /*
 Brochage typique INMP441 ↔ ESP32
@@ -17,32 +17,19 @@ L/R	        GND	      Canal gauche (Left)
 */
 
 bool crackCounterStatus = false; // true = running, false = not running
-bool isCalibrated = false;    // true = calibration has been done and finished ok, false=calibraton not done, skip counting
+bool isCalibrated = false;       // true = calibration has been done and finished ok, false=calibraton not done, skip counting
 bool audioStarted = false;       // true = audio correctly initialized, false = not initialized, therefore no feature working
-bool calibrating  = false;     // true is calibration is being run and not finished
-NimBLECharacteristic* envAudioChar = nullptr;
+bool calibrating = false;        // true is calibration is being run and not finished
+NimBLECharacteristic *envAudioChar = nullptr;
 
 // audio processing variables
 int16_t samples[BUFFER_SIZE];
-double vReal[BUFFER_SIZE];
-double vImag[BUFFER_SIZE];
 int16_t crack_counter = 0;       // number of cracks count since last calibration
 unsigned long lastCrackTime = 0; // last timestamp a crack is detected
-float energyThreshold = 0.0F;
-float noiseMean = 0, noiseStd = 0;
-uint32_t totalCracks = 0;
-int bandEnergyMin = 4500;
-int bandEnergyMax = 8000;
-int low_bandEnergyMin = 200;
-int low_bandEnergyMax = 2000;
-float lowEnergyGate = 35000.0; // <-- AUGMENTÉ : Seuil absolu au-dessus du bruit moyen (~21000)
-float energycoeff = 1.70;      // <-- AUGMENTÉ : Ratio minimal pour être un crack (avant à 1.6)
 
 // Global handle for the calibration task
 TaskHandle_t calibrateTaskHandle = NULL;
 TaskHandle_t monitorTaskHandle = NULL;
-
-ArduinoFFT<double> FFT(vReal, vImag, BUFFER_SIZE, I2S_SAMPLE_RATE);
 
 // Structure to hold environmental data for BLE transmission
 typedef struct __attribute__((packed))
@@ -61,185 +48,331 @@ typedef struct __attribute__((packed))
   uint16_t footer = 0xAAAA; // End of message footer
 } AudioCommand;
 
-// --- FFT band energy ---
-double bandEnergy(double *v, int lowHz, int highHz)
-{
-  int lowBin = (lowHz * BUFFER_SIZE) / I2S_SAMPLE_RATE;
-  int highBin = (highHz * BUFFER_SIZE) / I2S_SAMPLE_RATE;
-  double sum = 0;
-  for (int i = lowBin; i <= highBin; i++)
-    sum += v[i];
-  return sum / (highBin - lowBin + 1);
-}
+float filter_state[2] = {0, 0};
+float coeffs[5];
+
+AudioStats stats = {0, 0.0f, 0.0f, 0.1f};
+
+static float fft_input[BUFFER_SIZE * 2]; // La FFT demande un buffer complexe (réel + imaginaire)
+static float fft_window[BUFFER_SIZE];
+static float fft_output[BUFFER_SIZE];
+
+// Indicateurs de qualité de l'environnement
+float noise_std_dev = 0; // Écart-type (stabilité du bruit)
+float signal_to_noise_estimated = 0;
 
 void calibrateTask(void *pvParameters)
 {
-    Serial.println("Audio process - calibrating in background (30 seconds lock on audio features)...");
+  float sum_rms = 0;
+  float sum_sq_rms = 0;
+  int count = 0;
+  float peak_during_calib = 0;
+  
+  calibrating = true;
+  Serial.println("\n>>> Audio process - Calibrating... Stay quiet!");
+  Serial.println("Progress: [--------------------]  Peak Amp");
 
-    calibrating = true; // just in case it, normaly set y task launcher
-    double accumEnergy = 0, accumSq = 0;
-    int count = 0;
-    bool bIsCalibrated;
+  unsigned long start = millis();
+  unsigned long last_ui_update = 0;
 
-    // Use a loop that checks the current time (non-blocking wait)
-    for (unsigned long start = millis(); millis() - start < CALIB_TIME_MS; )
-    {
-        int32_t raw[BUFFER_SIZE];
-        size_t bytesRead = 0;
-
-        esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
-        if (result == ESP_OK && bytesRead > 0)
-        {
-            int n = bytesRead / sizeof(int32_t);
-            for (int i = 0; i < n; i++)
-            {
-                int16_t val = raw[i] >> 14;
-                vReal[i] = val;
-                vImag[i] = 0;
-            }
-
-            FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-            FFT.compute(FFTDirection::Forward);
-            FFT.complexToMagnitude();
-
-            double e = bandEnergy(vReal, bandEnergyMin, bandEnergyMax);
-            accumEnergy += e;
-            accumSq += e * e;
-            count++;
-        }
-        // Give control back to the scheduler for other tasks (optional but good practice)
-        vTaskDelay(1); 
-    }
-    // --- Post-Calibration Processing ---
-    if (count == 0)
-    {
-        Serial.println("Audio process - calibration has failed, no data was fetched");
-        bIsCalibrated = false; // cannot unlock other audio features 
-    }
-    else
-    {
-        noiseMean = accumEnergy / count;
-        noiseStd = sqrt((accumSq / count) - (noiseMean * noiseMean));
-        energyThreshold = noiseMean + 3 * noiseStd;
-        Serial.printf("Audio process - calibration is done on %d packets : average noise = %.2f | treshold = %.2f\n", count, noiseMean, energyThreshold);
-        crack_counter = 0; // reset crack counter
-        bIsCalibrated = true; // set flag to allow to unlock audio features
-    }
+  while (millis() - start < CALIB_TIME_MS)
+  {
+    int32_t raw[BUFFER_SIZE];
+    size_t bytesRead = 0;
     
-    // Clean up
-    calibrating = false;
-    calibrateTaskHandle = NULL; // Clear the handle
-    isCalibrated = bIsCalibrated;  // avoid that monitor starts before all the other parameters are set
+    esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
+    
+    if (result == ESP_OK && bytesRead > 0)
+    {
+      int n = bytesRead / sizeof(int32_t);
+      float current_sum_sq = 0;
+      float local_peak = 0;
 
-    if (isCalibrated) {
-        saveCalibrationToFile(); // Sauvegarder les nouveaux paramètres
+      for (int i = 0; i < n; i++)
+      {
+        float s = (float)(raw[i] >> 8) / 8388608.0f;
+        current_sum_sq += s * s;
+        float abs_s = fabsf(s);
+        if (abs_s > local_peak) local_peak = abs_s;
+      }
+
+      if (local_peak > peak_during_calib) peak_during_calib = local_peak;
+
+      float current_rms = sqrtf(current_sum_sq / n);
+      sum_rms += current_rms;
+      sum_sq_rms += (current_rms * current_rms);
+      count++;
+
+      // --- MISE À JOUR VISUELLE (Toutes les 200ms) ---
+      if (millis() - last_ui_update > 200) {
+          last_ui_update = millis();
+          
+          // 1. Calcul de la progression (0 à 20 barres)
+          int progress = (int)((millis() - start) * 20 / CALIB_TIME_MS);
+          
+          // 2. Création d'un petit vumètre pour le pic local
+          int vu_len = (int)(local_peak * 40); 
+          if (vu_len > 20) vu_len = 20;
+
+          Serial.print("\rProgress: [");
+          for(int i=0; i<20; i++) Serial.print(i < progress ? "#" : "-");
+          Serial.print("]  Peak: ");
+          for(int i=0; i<vu_len; i++) Serial.print(">");
+          for(int i=vu_len; i<20; i++) Serial.print(" ");
+          Serial.printf(" (%.4f)", local_peak);
+          Serial.flush(); // Pour être sûr que l'affichage est immédiat
+      }
     }
+    vTaskDelay(1); 
+  }
+  Serial.println(); // Saut de ligne après la fin des barres
 
-    vTaskDelete(NULL);          // Delete the current task
+  // --- Post-Calibration  ---
+  if (count == 0) {
+    Serial.println("Audio process - calibration has failed (no data)");
+    isCalibrated = false;
+  } else {
+    stats.noise_floor_rms = sum_rms / count;
+    float variance = (sum_sq_rms / count) - (stats.noise_floor_rms * stats.noise_floor_rms);
+    float std_dev = sqrtf(fmaxf(0, variance));
+
+//    stats.threshold = (stats.noise_floor_rms * 6.0f) + (std_dev * 3.0f);
+    stats.threshold = (stats.noise_floor_rms * 12.0f) + (std_dev * 5.0f);
+    stats.peak_amplitude = peak_during_calib;
+    // --- AFFICHAGE DU SCORE DE QUALITÉ ---
+    Serial.println("---------- RÉSULTATS ----------");
+    Serial.printf("Bruit de fond moyen : %.6f\n", stats.noise_floor_rms);
+    Serial.printf("Instabilité (StdDev): %.6f\n", std_dev);
+    Serial.printf("Pic max détecté     : %.6f\n", peak_during_calib);
+    Serial.printf("SEUIL CALCULÉ       : %.6f\n", stats.threshold);
+    
+    if (stats.noise_floor_rms > 0.05f) {
+        Serial.println("ALERTE : Environnement très bruyant ! Éloignez le micro du moteur.");
+    } else if (std_dev > (stats.noise_floor_rms * 0.5f)) {
+        Serial.println("ALERTE : Bruit instable (trop de ventilation ou atténuer les vibrations).");
+    } else {
+        Serial.println("QUALITÉ : Environnement stable et clair.");
+    }
+    Serial.println("-------------------------------\n");
+    crack_counter = 0;
+    isCalibrated = true;
+    saveCalibrationToFile();   
+  }
+
+  calibrating = false;
+  calibrateTaskHandle = NULL;
+  vTaskDelete(NULL);
 }
 
 // run Calibration function
 void calibrate()
 {
-  if (calibrating) {
-        Serial.println("Audio process - Calibration already running!");
-        return;
-    }
+  if (calibrating)
+  {
+    Serial.println("Audio process - Calibration already running!");
+    return;
+  }
   // locck access to calibration
   calibrating = true;
+  crack_counter = -1; // during calibration, set to -1 to indicate not ready
   Serial.println("Audio process - Starting Calibration Task...");
 
   // Create the task
   xTaskCreatePinnedToCore(
-      calibrateTask,          // Task function
-      "CalibrateTask",        // Name for the task
-      12288,                   // Stack size (increase if needed)
-      NULL,                   // Parameter to pass
-      1,                      // Priority (1 is usually fine)
-      &calibrateTaskHandle,   // Task handle (for referencing)
-      1                       // Core to run on (Core 1 is good for non-BLE/WiFi tasks)
+      calibrateTask,        // Task function
+      "CalibrateTask",      // Name for the task
+      12288,                // Stack size (increase if needed)
+      NULL,                 // Parameter to pass
+      1,                    // Priority (1 is usually fine)
+      &calibrateTaskHandle, // Task handle (for referencing)
+      1                     // Core to run on (Core 1 is good for non-BLE/WiFi tasks)
   );
 }
 
+void initFFT() {
+    // Initialisation des fenêtres de Hann pour lisser les résultats
+    dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    dsps_wind_hann_f32(fft_window, BUFFER_SIZE);
+}
+
+void analyzeFrequency(float* data, int n) {
+    // 1 & 2: FFT
+    for (int i = 0; i < n; i++) {
+        fft_input[i * 2 + 0] = data[i] * fft_window[i];
+        fft_input[i * 2 + 1] = 0;
+    }
+    dsps_fft2r_fc32(fft_input, n);
+    dsps_bit_rev_fc32(fft_input, n);
+    
+    for (int i = 0; i < n / 2; i++) {
+        float re = fft_input[i * 2 + 0];
+        float im = fft_input[i * 2 + 1];
+        fft_output[i] = sqrtf(re * re + im * im) / n;
+    }
+
+    float bin_width = (float)I2S_SAMPLE_RATE / n;
+    float max_crack_energy = 0;
+    float total_energy = 0;
+
+    // --- LIGNE 1 : SPECTRE GLOBAL (0 - 5kHz) ---
+    Serial.print("\nGlobal : ");
+    for (int i = 0; i < n / 2; i += 6) {
+        float freq = i * bin_width;
+        if (freq > 5000) break;
+        float val = fft_output[i] * 15000.0f;
+        if (val > 10) Serial.print("H");      // Peak fort
+        else if (val > 2) Serial.print("x");  // Activité
+        else Serial.print(".");               // Bruit
+        total_energy += fft_output[i];
+    }
+
+    // --- LIGNE 2 : FOCUS CRACK (1.5kHz - 4kHz) ---
+    Serial.print("\nFocus  :           "); // Espacement pour aligner
+    for (int i = 0; i < n / 2; i += 6) {
+        float freq = i * bin_width;
+        if (freq > 5000) break;
+        if (freq >= 1500 && freq <= 4000) {
+            float val = fft_output[i] * 25000.0f; // Plus de gain sur cette zone
+            if (val > 5) {
+                Serial.print("^");
+                if (val > max_crack_energy) max_crack_energy = val;
+            } else Serial.print(" ");
+        } else {
+            Serial.print(" ");
+        }
+    }
+
+    // --- LIGNE 3 : BARRE D'INTENSITÉ ---
+    Serial.print("\nImpact : ");
+    int power = (int)(max_crack_energy * 4);
+    if (power > 40) power = 40;
+    Serial.print("[");
+    for(int j=0; j<40; j++) {
+        if (j < power) Serial.print("=");
+        else Serial.print(" ");
+    }
+    Serial.printf("] +%.1f dB\n", 20 * log10f(max_crack_energy + 0.0001f));
+    Serial.println("--------------------------------------------------");
+}
 
 void monitorAudioTask(void *pvParameters)
 {
-    Serial.println("Audio process - Monitoring Task starting");
+  static float input_f[BUFFER_SIZE]; 
+  static float output_f[BUFFER_SIZE];  uint32_t last_crack_time = 0;
+  bool last_status_was_running = false;
+  UBaseType_t uxHighWaterMark;
+  static int check_count = 0;
+  // diagnostic
+  static float max_observed = 0;
+  
 
-    while (1) // The task runs forever unless explicitly deleted
+  Serial.println("Audio process - Monitoring Task starting");
+  uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+
+  Serial.printf("Free stack : %d words (4 bytes)\n", uxHighWaterMark);
+  
+  initFFT();
+
+  while (1)
+  {
+    // Vérification des conditions : Doit être calibré ET le comptage doit être activé
+    if (isCalibrated && crackCounterStatus) 
     {
-        // Check Control Flags: Only run core logic if calibrated AND started
-        if (isCalibrated && crackCounterStatus) 
+      // Si on vient de démarrer le comptage, on réinitialise l'état du filtre
+      if (!last_status_was_running) {
+        filter_state[0] = 0;
+        filter_state[1] = 0;
+        last_status_was_running = true;
+        Serial.println("Audio process - Monitor logic active");
+      }
+
+      int32_t raw[BUFFER_SIZE];
+      size_t bytesRead = 0;
+
+      // Lecture des données I2S
+      esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
+      
+      if (result == ESP_OK && bytesRead > 0)
+      {
+        int n = bytesRead / sizeof(int32_t);
+        
+        for (int i = 0; i < n; i++)
         {
-            // --- Core Logic from original monitorAudio() ---
-            int32_t raw[BUFFER_SIZE];
-            size_t bytesRead = 0;
+          // Traitement INMP441 : 24 bits signés alignés à gauche dans un 32 bits
+          // On décale de 8 pour supprimer les 8 bits de padding/LSB
+          int32_t sample_32 = raw[i] >> 8;
+          // Normalisation par 2^23 (8388608.0f) pour obtenir un float entre -1.0 et 1.0
+          input_f[i] = (float)sample_32 / 8388608.0f;
+        }
 
-            // Reading audio from I2S - Use a brief delay instead of portMAX_DELAY 
-            // if you want the loop to check flags more often, but portMAX_DELAY is good for audio flow control.
-            esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
-            
-            if (result == ESP_OK && bytesRead > 0) 
-            {
-                // Convert, FFT, Magnitude, and Crack Detection logic
-                int n = bytesRead / sizeof(int32_t);
-                if (n > 0)
-                {
-                    for (int i = 0; i < n; i++)
-                    {
-                        int16_t val = raw[i] >> 14;
-                        vReal[i] = val;
-                        vImag[i] = 0;
-                    }
-
-                    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-                    FFT.compute(FFTDirection::Forward);
-                    FFT.complexToMagnitude();
-
-                    // 1. Calculer l'énergie de la bande CRACK (Haute Fréquence)
-                    double highEnergy = bandEnergy(vReal, bandEnergyMin, bandEnergyMax); 
-
-                    // 2. Calculer l'énergie de la bande BRUIT (Basse Fréquence)
-                    // Élargissement de la bande pour capturer plus de bruit de fond stable (e.g., 200 Hz à 2000 Hz)
-                    double lowEnergy = bandEnergy(vReal, low_bandEnergyMin, low_bandEnergyMax); // 300, 1500 -> 200, 2000
-
-                    // 3. Calculer le Ratio
-                    double ratio = 0.0;
-                    // Garde-fou : Le dénominateur doit être suffisant pour éviter une division erronée
-                    if (lowEnergy > 5000.0) { // Augmenté pour garantir un dénominateur stable et significatif
-                        ratio = highEnergy / lowEnergy;
-                    }
-
-                    unsigned long now = millis();
-                    
-//                    const double MIN_CRACK_ENERGY_GATE = lowEnergyGate; // Garde-fou de l'énergie
-//                    const double MIN_RATIO_THRESHOLD = energycoeff;     // Seuil de ratio (LE POINT CRITIQUE À AJUSTER)
-                    //if (ratio > 0)
-                    Serial.printf("- mon - H=%.2f L=%.2f R=%.2f\n", highEnergy, lowEnergy, ratio);
-                    if (highEnergy > lowEnergyGate && 
-                        ratio > energycoeff && 
-                        (now - lastCrackTime) > REFRACTORY_MS) // 150ms
-                    {
-                        crack_counter++; 
-                        lastCrackTime = now;
-                        Serial.printf("- mon - crack detected! count=%d \n", crack_counter);
-                    }
-                  }
+        // Filtrage passe-bas avec esp-dsp
+        dsps_biquad_f32_ansi(input_f, output_f, n, coeffs, filter_state);
+        static float last_amp = 0;
+        for (int i = 0; i < n; i++)
+        {
+          float amp = fabsf(output_f[i]);
+          
+          // diagnostic
+          float current_amp = amp; // l'amplitude filtrée
+          if (current_amp > max_observed) max_observed = current_amp;
+          static uint32_t last_report = 0;
+          if (millis() - last_report > 2000) {
+            static float delta = abs((current_amp - stats.threshold)/stats.threshold);
+            Serial.printf("delta: %.0f% Noise: %.4f | Treshold: %.4f | Max pike: %.4f\n", 
+                          delta*100.0f, current_amp, stats.threshold, max_observed);
+            if (delta <= 0.1f) {
+                Serial.println("Warning: Ambient noise close to threshold, consider re-calibrating, either microphone is too close either raise filter freq.");
             }
+            last_report = millis();
+            max_observed = 0; 
+          }
+          // end diagnostic
+
+          // Comparaison avec le seuil calculé lors de la calibration
+          if (amp > stats.threshold && amp > (last_amp * 3.0f))
+          {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            
+            // Gestion du temps mort (Dead Time) pour éviter les doubles comptages d'un même son
+            if (now - last_crack_time > DSP_DEAD_TIME_MS)
+            {
+              crack_counter++;
+              stats.crack_count = crack_counter; // Mise à jour de la structure stats
+              if (amp > stats.peak_amplitude)
+                stats.peak_amplitude = amp;
+              last_crack_time = now;
+              analyzeFrequency(output_f, n);
+              Serial.printf("- mon - crack detected! count=%d amp=%.4f\n", crack_counter, amp);
+            }
+          }
         }
-        else 
-        {
-            // If not calibrated or counting is stopped, yield to other tasks
-            vTaskDelay(100 / portTICK_PERIOD_MS); 
-        }
+      }
+      if (++check_count >= 100) {
+          uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+          Serial.printf("Stack High Water Mark : %d free words\n", uxHighWaterMark);
+          check_count = 0;
+      }
     }
+    else
+    {
+      // Si en pause ou non calibré, on relâche le CPU
+      if (last_status_was_running) {
+          last_status_was_running = false;
+          Serial.println("Audio process - Monitor logic paused");
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Petite pause pour laisser les autres tâches (BLE/System) respirer
+    vTaskDelay(1); 
+  }
 }
 
 void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
 {
   AudioData data;
   // Read or simulate data
-  data.crack_count = (!isCalibrated || !audioStarted ? 0 : crack_counter);
+  data.crack_count = (!isCalibrated || !audioStarted ? -1 : crack_counter);
   // Calculate checksum over the data payload (excluding header and footer)
   // The payload starts right after the header field
   const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&data) + sizeof(data.header);
@@ -247,14 +380,14 @@ void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLECon
   size_t payloadLength = sizeof(data.crack_count);
   data.checksum = calculateChecksum(payloadPtr, payloadLength);
   // Set the characteristic value with the entire structure
-  pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData)); 
+  pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData));
   // Print current values to the Serial Monitor
   Serial.printf("on read received - crack counter: %d crack(s)\n", (float)data.crack_count);
 }
 
-void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) 
+void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
 {
- if (!audioStarted)
+  if (!audioStarted)
     return;
 
   std::string rxData = pCharacteristic->getValue();
@@ -265,17 +398,17 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     return;
   }
   AudioCommand cmd; // Créer une instance locale de la structure
-  memcpy(&cmd, rxData.data(), sizeof(AudioCommand)); 
-//  Serial.println("debug - command copied");
+  memcpy(&cmd, rxData.data(), sizeof(AudioCommand));
+  //  Serial.println("debug - command copied");
   // Define the payload for checksum calculation
   // Le pointeur pointe vers l'adresse de 'cmd', puis on avance de la taille du header.
-  const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&cmd) + sizeof(cmd.header);   
-//  Serial.println("debug - payload unpacked");
+  const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&cmd) + sizeof(cmd.header);
+  //  Serial.println("debug - payload unpacked");
   // Payload length = size of command field
   size_t payloadLength = sizeof(cmd.command);
   // Calculate the expected checksum
   uint8_t calculatedChecksum = calculateChecksum(payloadPtr, payloadLength);
-//  Serial.println("debug - checksum calculated");
+  //  Serial.println("debug - checksum calculated");
 
   // Verify Checksum and Header/Footer for data integrity
   if (cmd.header != 0x5555 || cmd.footer != 0xAAAA)
@@ -289,19 +422,19 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     return;
   }
   // Checksum is valid! Unpack and execute the command
-  //Serial.printf("WRITE Success! Valid Command Received: 0x%04X\n", cmd.command);
   switch (cmd.command)
   {
   case COMMAND_RUNCALIBRATION:
     crackCounterStatus = false; // Example use of a global state variable
-    crack_counter = 0;
+    crack_counter = -1;
     calibrate();
     break;
   case COMMAND_START_SAMPLING:
     if (isCalibrated)
     {
       crackCounterStatus = true;
-      Serial.println("Audip process - start Sampling/Counting");
+      crack_counter = 0;
+      Serial.println("Audio process - start Sampling/Counting");
     }
     break;
   case COMMAND_STOP_SAMPLING:
@@ -315,10 +448,12 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
     if (calibrating)
     {
       Serial.println("Audio process - status request, calibration running, please wait!");
-    } else
-    if (isCalibrated) {
+    }
+    else if (isCalibrated)
+    {
       Serial.println("Audio process - status request, calibration OK");
-    } else
+    }
+    else
     {
       Serial.println("Audio process - status request, calibration not done yet or KO");
     }
@@ -329,12 +464,12 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
   }
 }
 
-void AudioDataCallbacks::onStatus(NimBLECharacteristic *pCharacteristic, int code) 
+void AudioDataCallbacks::onStatus(NimBLECharacteristic *pCharacteristic, int code)
 {
   Serial.printf("Notification/Indication return code on audio : %d, %s\n", code, NimBLEUtils::returnCodeToString(code));
 }
 
-void AudioDataCallbacks::onSubscribe(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo, uint16_t subValue) 
+void AudioDataCallbacks::onSubscribe(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo, uint16_t subValue)
 {
   std::string str = "Client ID: ";
   str += connInfo.getConnHandle();
@@ -364,83 +499,89 @@ void AudioDataCallbacks::onSubscribe(NimBLECharacteristic *pCharacteristic, NimB
  * @brief Sauvegarde les paramètres de calibration (noiseMean, noiseStd, energyThreshold, energycoeff) dans un fichier JSON.
  * @return true si la sauvegarde a réussi, false sinon.
  */
-bool saveCalibrationToFile() {
-    // La taille du document dépend de vos données. 
-    // Pour 4 float (4x8=32 octets) + clés + surcoût, 128 octets sont largement suffisants.
-    JsonDocument doc;
+bool saveCalibrationToFile()
+{
+  // La taille du document dépend de vos données.
+  // Pour 4 float (4x8=32 octets) + clés + surcoût, 128 octets sont largement suffisants.
+  JsonDocument doc;
 
-    doc["noiseMean"] = noiseMean;
-    doc["noiseStd"] = noiseStd;
-    doc["energyThreshold"] = energyThreshold;
-    doc["energycoeff"] = energycoeff;
-    doc["isCalibrated"] = true; // Sauvegarder l'état de calibration
+  doc["peak_amplitude"] = stats.peak_amplitude;
+  doc["noise_floor_rms"] = stats.noise_floor_rms;
+  doc["threshold"] = stats.threshold;
+  doc["isCalibrated"] = true; // Sauvegarder l'état de calibration
 
-    Serial.printf("Audio process - Saving calibration to %s...\n", CALIBRATION_FILE);
+  Serial.printf("Audio process - Saving calibration to %s...\n", CALIBRATION_FILE);
 
-    File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_WRITE);
-    if (!file) {
-        Serial.println("Audio process - Failed to open file for writing!");
-        return false;
-    }
+  File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("Audio process - Failed to open file for writing!");
+    return false;
+  }
 
-    if (serializeJson(doc, file) == 0) {
-        Serial.println("Audio process - Failed to write to file!");
-        file.close();
-        return false;
-    }
-    
+  if (serializeJson(doc, file) == 0)
+  {
+    Serial.println("Audio process - Failed to write to file!");
     file.close();
-    Serial.println("Audio process - Calibration saved successfully.");
-    return true;
+    return false;
+  }
+
+  file.close();
+  Serial.println("Audio process - Calibration saved successfully.");
+  return true;
 }
 
 /**
  * @brief Charge les paramètres de calibration à partir du fichier JSON.
  * @return true si le chargement a réussi et les paramètres sont valides, false sinon.
  */
-bool loadCalibrationFromFile() {
-    if (!FILE_SYSTEM.exists(CALIBRATION_FILE)) {
-        Serial.println("Audio process - Calibration file not found.");
-        return false;
-    }
+bool loadCalibrationFromFile()
+{
+  if (!FILE_SYSTEM.exists(CALIBRATION_FILE))
+  {
+    Serial.println("Audio process - Calibration file not found.");
+    return false;
+  }
 
-    File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_READ);
-    if (!file) {
-        Serial.println("Audio process - Failed to open calibration file for reading.");
-        return false;
-    }
+  File file = FILE_SYSTEM.open(CALIBRATION_FILE, FILE_READ);
+  if (!file)
+  {
+    Serial.println("Audio process - Failed to open calibration file for reading.");
+    return false;
+  }
 
-    JsonDocument doc;
+  JsonDocument doc;
 
-    DeserializationError error = deserializeJson(doc, file);
-    file.close();
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
 
-    if (error) {
-        Serial.printf("Audio process - Failed to read file, error: %s\n", error.c_str());
-        return false;
-    }
+  if (error)
+  {
+    Serial.printf("Audio process - Failed to read file, error: %s\n", error.c_str());
+    return false;
+  }
 
-    // Vérification de la présence des clés
-    if (!doc["noiseMean"] || !doc["isCalibrated"]) {
-        Serial.println("Audio process - Calibration file is incomplete or invalid.");
-        return false;
-    }
-    
-    // Assignation des valeurs globales
-    noiseMean = doc["noiseMean"].as<float>();
-    noiseStd = doc["noiseStd"].as<float>();
-    energyThreshold = doc["energyThreshold"].as<float>();
-    energycoeff = doc["energycoeff"].as<float>();
-    isCalibrated = doc["isCalibrated"].as<bool>();
-    
-    Serial.printf("Audio process - Calibration loaded from file: Mean=%.2f, Threshold=%.2f, Ratio=%.2f\n", 
-                  noiseMean, energyThreshold, energycoeff);
-    
-    return isCalibrated; // Retourne l'état de calibration chargé
+  // Vérification de la présence des clés
+  if (!doc["threshold"] || !doc["peak_amplitude"] || !doc["noise_floor_rms"] || !doc["isCalibrated"])
+  {
+    Serial.println("Audio process - Calibration file is incomplete or invalid.");
+    return false;
+  }
+
+  // Assignation des valeurs globales
+  stats.noise_floor_rms = doc["noise_floor_rms"].as<float>();
+  stats.threshold = doc["threshold"].as<float>();
+  stats.peak_amplitude = doc["peak_amplitude"].as<float>();
+  isCalibrated = doc["isCalibrated"].as<bool>();
+
+  Serial.printf("Audio process - Calibration loaded from file: floor=%.2f, Threshold=%.2f, peak=%.2f\n",
+                stats.noise_floor_rms, stats.threshold, stats.peak_amplitude);
+  return isCalibrated; // Retourne l'état de calibration chargé
 }
 
 #if defined(TESTMODE)
-int TestAudio(int m) {
+int TestAudio(int m)
+{
   switch (m)
   {
   case COMMAND_RUNCALIBRATION:
@@ -469,53 +610,37 @@ int TestAudio(int m) {
     {
       Serial.println("Audio process - status request, calibration running, please wait!");
       return 0;
-    } else
-    if (isCalibrated) {
-      //Serial.println("Audio process - status request, calibration OK");
-      return 1;
-    } else
+    }
+    else if (isCalibrated)
     {
-      //Serial.println("Audio process - status request, calibration not done yet or KO");
+      // Serial.println("Audio process - status request, calibration OK");
+      return 1;
+    }
+    else
+    {
+      // Serial.println("Audio process - status request, calibration not done yet or KO");
       return 0;
     }
     break;
   case COMMAND_SAMPLINGSTATUS:
     if (calibrating)
       return 0;
+    else if (isCalibrated)
+      return (crackCounterStatus ? 1 : 0);
     else
-      if (isCalibrated) 
-        return (crackCounterStatus?1:0);
-      else
-        return 0;
+      return 0;
   case COMMAND_GETCRACKCOUNTER:
     if (calibrating)
       return -1;
-    else
-      if (isCalibrated) 
-        if (crackCounterStatus)
-          return crack_counter;
-        else
-          return -1;
-  case COMMAND_RAISERATIO:
-    energycoeff += 0.1;
-    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
-    return 1;
-  case COMMAND_DECREASERATIO:
-    energycoeff -= 0.1;
-    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
-    return 1;
-  case COMMAND_RAISERATIO5:
-    energycoeff += 0.5;
-    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
-    return 1;
-  case COMMAND_DECREASERATIO5:
-    energycoeff -= 0.1;
-    Serial.printf("Audio process - coefficient set to %f\n",energycoeff);
-    return 1;
+    else if (isCalibrated)
+      if (crackCounterStatus)
+        return crack_counter;
+      else
+        return -1;
   default:
     Serial.printf("-Audio process - status request, Unknown command: 0x%04X\n", m);
     break;
   }
-    return 0;
+  return 0;
 }
 #endif

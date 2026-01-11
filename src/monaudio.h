@@ -2,7 +2,6 @@
 #define TILAUONAUDIO_H
 
 #include <driver/i2s.h>
-#include <arduinoFFT.h>
 
 #include <FS.h> 
 #include <LittleFS.h> 
@@ -18,14 +17,37 @@
 
 #define CALIBRATION_FILE "/audio_calib.json"
 
+// ************** New audio parameters start ******************
+#include "esp_dsp.h"
+#include "freertos/semphr.h"
+
+#define DSP_DEAD_TIME_MS    200     // Anti-écho pour le tambour métallique
+struct AudioStats {
+    uint32_t crack_count;
+    float peak_amplitude;
+    float noise_floor_rms;
+    float threshold;
+};
+
+extern AudioStats stats;
+
+// DSP Buffers et Coeffs
+extern float coeffs[5];
+extern float filter_state[2];
+
+// Audio processing parameters
+
 #define BUFFER_SIZE       1024
 #define REFRACTORY_MS     150
 #define CALIB_TIME_MS     30000
 #define I2S_SAMPLE_RATE   16000
+#define CUTTFOFF_FREQ     2500.0f // basic current cutoff frequency for low-pass filter
 #define I2S_WS_PIN    25 // L/R Clock (Word Select)
 #define I2S_SD_PIN    32 // Data Out (SD/DOUT)
 #define I2S_SCK_PIN   33 // Bit Clock
 #define I2S_PORT      I2S_NUM_0 // Utilisation du port I2S 0
+
+// Audio command definitions
 
 #define COMMAND_RUNCALIBRATION      0x0000
 #define COMMAND_START_SAMPLING      0x0001
@@ -59,6 +81,7 @@ int TestAudio(int m);
 extern bool crackCounterStatus; // true = running, false = not running
 extern bool isCalibrated;    // true = calibration has been done and finished ok, false=calibraton not done, skip counting
 extern bool audioStarted;       // true = audio correctly initialized, false = not initialized, therefore no feature working
+extern bool calibrating;        // true is calibration is being run and not finished
 
 bool saveCalibrationToFile();
 bool loadCalibrationFromFile();

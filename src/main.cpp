@@ -12,13 +12,6 @@
 #include "common.h"
 #include "monaudio.h"
 
-#define START_BLE
-#if not defined(START_BLE)
-// Variables de contrôle
-long last_print_time = 0;
-const long PRINT_INTERVAL = 1000; // Affichage toutes les 1000 ms (1 seconde)
-#endif
-
 // --- Definitions ---
 // Standard atmospheric pressure at sea level in hPa (used for altitude calculation)
 #define SEALEVELPRESSURE_HPA (1013.25)
@@ -101,7 +94,7 @@ class EnvironmentDataCallbacks : public NimBLECharacteristicCallbacks
         // temp_f = hum_f = press_f = alt_f = 0.0F;
         Serial.printf("onread error %f %f %f %f\n", temp_f, hum_f, press_f, alt_f);
       }
-      else
+      else if (!(isCalibrated && crackCounterStatus))
         Serial.printf("onread debug %f %f %f %f\n", temp_f, hum_f, press_f, alt_f);
     }
 
@@ -125,8 +118,9 @@ class EnvironmentDataCallbacks : public NimBLECharacteristicCallbacks
     // pCharacteristic->setValue((uint8_t *)&data, sizeof(EnvData));
 
     // Print current values to the Serial Monitor
-    Serial.printf("T: %.1f °C | H: %.1f %% | P: %.1f hPa | A: %.1f masl | Checksum: 0x%02X\n",
-                  (float)data.temp_x10 / 10.0, (float)data.hum_x10 / 10.0, (float)data.press_x10 / 10.0, (float)data.alt_x10 / 10.0, data.checksum);
+    if (!(isCalibrated && crackCounterStatus))
+      Serial.printf("T: %.1f °C | H: %.1f %% | P: %.1f hPa | A: %.1f masl | Checksum: 0x%02X\n",
+                    (float)data.temp_x10 / 10.0, (float)data.hum_x10 / 10.0, (float)data.press_x10 / 10.0, (float)data.alt_x10 / 10.0, data.checksum);
   }
 
   /**
@@ -281,201 +275,190 @@ void setup()
 
 #if defined(TILAUONAUDIO_H)
 
-    // now working on audio threads
-    // set I2S default values for acquiring 24 bits data from microphone
+  // now working on audio threads
+  // set I2S default values for acquiring 24 bits data from microphone
 
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = I2S_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,      // <-- Assurer 32 bits
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,      // ou ONLY_RIGHT selon votre L/R pin
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      .intr_alloc_flags = 0,
-        .dma_buf_count = 8,
-        .dma_buf_len = 256,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0};
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+      .sample_rate = I2S_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,      // <-- Assurer 32 bits
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,      // ou ONLY_RIGHT selon votre L/R pin
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      .intr_alloc_flags = 0,
+      .dma_buf_count = 8,
+      .dma_buf_len = 256,
+      .use_apll = false,
+      .tx_desc_auto_clear = false,
+      .fixed_mclk = 0};
 
-    i2s_pin_config_t pin_config = {// change pin settings in .H header file if necessary (13,14,34)
-                                   .bck_io_num = I2S_SCK_PIN,
-                                   .ws_io_num = I2S_WS_PIN,
-                                   .data_out_num = I2S_PIN_NO_CHANGE,
-                                   .data_in_num = I2S_SD_PIN};
+  i2s_pin_config_t pin_config = {// change pin settings in .H header file if necessary (13,14,34)
+                                 .bck_io_num = I2S_SCK_PIN,
+                                 .ws_io_num = I2S_WS_PIN,
+                                 .data_out_num = I2S_PIN_NO_CHANGE,
+                                 .data_in_num = I2S_SD_PIN};
 
-    Serial.println("try to install I2S interface");
-    err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  Serial.println("try to install I2S interface");
+  err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (err != ESP_OK)
+  {
+    Serial.printf("Erreur i2s_driver_install: %d\n", err);
+    audioStarted = false;
+  }
+  else
+  {
+    err = i2s_set_pin(I2S_PORT, &pin_config);
     if (err != ESP_OK)
     {
-      Serial.printf("Erreur i2s_driver_install: %d\n", err);
+      Serial.printf("Erreur i2s_set_pin: %d\n", err);
       audioStarted = false;
     }
     else
-    {
-      err = i2s_set_pin(I2S_PORT, &pin_config);
-      if (err != ESP_OK)
-      {
-        Serial.printf("Erreur i2s_set_pin: %d\n", err);
-        audioStarted = false;
-      }
-      else
+    { // configure DSP filter
+      err = dsps_biquad_gen_bpf0db_f32(coeffs, CUTTFOFF_FREQ / float(I2S_SAMPLE_RATE), 0.707f);
+      if (err == ESP_OK)
       {
         audioStarted = true;
         Serial.println("I2S started, listening to INMP441");
       }
-    };
-
-    Serial.println("Initializing File System...");
-    // Tenter de monter LittleFS
-    if (!FILE_SYSTEM.begin()) {
-        Serial.println("Failed to mount LittleFS. Attempting to format...");
-        
-        // --- LIGNE À AJOUTER TEMPORAIREMENT ---
-        if (FILE_SYSTEM.format()) {
-            Serial.println("LittleFS formatted successfully! Trying mount again...");
-            if (FILE_SYSTEM.begin()) {
-                Serial.println("LittleFS mounted successfully after format.");
-            } else {
-                Serial.println("Fatal: LittleFS mount failed even after format.");
-            }
-        } else {
-            Serial.println("Fatal: LittleFS format failed.");
-        }
-        // --- FIN LIGNES À AJOUTER ---
-        
-    } else {
-        Serial.println("File system mounted successfully.");
-    }
-    
-#if not defined(START_BLE)
-    if (audioStarted)
-    {
-      // Le mode test noble ne lance pas la calibration. Nous devons le faire ici.
-      Serial.println("Launching manual calibration for noble mode");
-      TestAudio(COMMAND_RUNCALIBRATION); // Lancer la fonction calibrate() qui crée calibrateTask
-    }
-#endif
-    Serial.println("Start Audio Sampling/Counting task");
-    xTaskCreatePinnedToCore(
-        monitorAudioTask,   // Task function for audio monitoring, send to a separate thread on a dedicated cpu
-        "MonitorAudioTask", // Name
-        12288,              // Stack size (increased for FFT use)
-        NULL,               // Parameter
-        2,                  // Priority (to calibrate)
-        &monitorTaskHandle, // Task handle
-        1                   // Core 1 (Recommended for heavy lifting)
-    );
-#endif
-
-#if defined(START_BLE)
-    Serial.println("initializing BLE");
-    // Initialize the Device and Server
-    bool initerr = NimBLEDevice::init(finalDeviceName);
-    if (initerr)
-      Serial.println("BLE init done");
-    else
-    {
-      Serial.println("BLE init failed, abort setup");
-      return; // stop initialization as there is no radio
-    }
-    NimBLEServer *server = NimBLEDevice::createServer();
-    // Set the server callback handler
-    server->setCallbacks(new ServerCallbacks());
-    // Create the Services and Characteristics
-    NimBLEService *envService = server->createService(SERVICE_UUID);
-    envDataChar = envService->createCharacteristic(
-        ENV_DATA_CHAR_UUID,
-        NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
-    );
-    envDataChar->setCallbacks(new EnvironmentDataCallbacks());
-
-    // if audio is there, add the audio characteristics
-#if defined(TILAUONAUDIO_H)
-    envAudioChar = envService->createCharacteristic(
-        ENV_AUDIO_CHAR_UUID,
-        NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
-    );
-    envAudioChar->setCallbacks(new AudioDataCallbacks());
-#endif
-
-    if (envService->start())
-      Serial.println("BLE server started");
-    else
-    {
-      Serial.println("BLE server failed to start, aborting");
-      return; // failed to start server, abort
-    }
-    Serial.println(">>-------------------------------------------------------------------------------------");
-
-    // now start advertising
-    Serial.println("BLE advertising init");
-    // Configure and Start Advertising
-    pAdvertising = NimBLEDevice::getAdvertising();
-    if (!pAdvertising->addServiceUUID(SERVICE_UUID))
-    {
-      Serial.println("Advertising failed to add Service UUID, abort");
-      return;
-    }
-    pAdvertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
-    pAdvertising->enableScanResponse(true);
-    pAdvertising->setName(finalDeviceName);
-    Serial.printf("BLE advertising starting on %s\n", SERVICE_UUID);
-    if (pAdvertising->start())
-    {
-      Serial.println("Advertising started successfully");
-    }
-    else
-    {
-      Serial.println("Advertising failed to start!, abort");
-      return;
-    }
-    Serial.printf("TilauScope Ambiant BLE service now fully ready, answer on nName: %s\n", finalDeviceName.c_str());
-    Serial.println(">>-------------------------------------------------------------------------------------");
-#else
-  Serial.println("started in noble mode for test");
-  previous = true;
-#endif
-  };
-
-  // --- Loop ---
-  void loop()
-  {
-#if defined(START_BLE)
-    // LED Blinking Management (Non-blocking)
-    unsigned long currentMillis = millis();
-    if (!deviceConnected)
-    {
-      // If device is not connected, blink the LED (indicates advertising/ready state)
-      if (currentMillis - previousMillis >= BLINK_INTERVAL)
-      {
-        // Save the current time
-        previousMillis = currentMillis;
-        // Toggle the LED state
-        int ledState = digitalRead(LED_PIN);
-        digitalWrite(LED_PIN, !ledState);
-      }
-    }
-    else
-    {
-      // A device is connected: keep the LED ON steadily
-      digitalWrite(LED_PIN, HIGH);
-    }
-#else
-  // Lire toutes les secondes
-  if (millis() - last_print_time >= PRINT_INTERVAL)
-  {
-
-    if (TestAudio(COMMAND_CALIBRATIONSTATE) == 1)
-    {
-      // calibration finished
-      if (TestAudio(COMMAND_SAMPLINGSTATUS) != 1)
-        TestAudio(COMMAND_START_SAMPLING);
       else
       {
-        Serial.printf("current crack counter = %d\n", TestAudio(COMMAND_GETCRACKCOUNTER));
+        Serial.printf("Erreur dsps_biquad_gen_bpf0db_f32: %d\n", err);
+        audioStarted = false;
       }
     }
+  };
 
-    last_print_time = millis();
+  Serial.println("Initializing File System...");
+  // Tenter de monter LittleFS
+  if (!FILE_SYSTEM.begin())
+  {
+    Serial.println("Failed to mount LittleFS. Attempting to format...");
+
+    // --- LIGNE À AJOUTER TEMPORAIREMENT ---
+    if (FILE_SYSTEM.format())
+    {
+      Serial.println("LittleFS formatted successfully! Trying mount again...");
+      if (FILE_SYSTEM.begin())
+      {
+        Serial.println("LittleFS mounted successfully after format.");
+      }
+      else
+      {
+        Serial.println("Fatal: LittleFS mount failed even after format.");
+      }
+    }
+    else
+    {
+      Serial.println("Fatal: LittleFS format failed.");
+    }
+    // --- FIN LIGNES À AJOUTER ---
+  }
+  else
+  {
+    Serial.println("File system mounted successfully.");
   }
 #endif
+
+  Serial.println("initializing BLE");
+  // Initialize the Device and Server
+  bool initerr = NimBLEDevice::init(finalDeviceName);
+  if (initerr)
+    Serial.println("BLE init done");
+  else
+  {
+    Serial.println("BLE init failed, abort setup");
+    return; // stop initialization as there is no radio
   }
+  NimBLEServer *server = NimBLEDevice::createServer();
+  // Set the server callback handler
+  server->setCallbacks(new ServerCallbacks());
+  // Create the Services and Characteristics
+  NimBLEService *envService = server->createService(SERVICE_UUID);
+  envDataChar = envService->createCharacteristic(
+      ENV_DATA_CHAR_UUID,
+      NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
+  );
+  envDataChar->setCallbacks(new EnvironmentDataCallbacks());
+
+  // if audio is there, add the audio characteristics
+#if defined(TILAUONAUDIO_H)
+  envAudioChar = envService->createCharacteristic(
+      ENV_AUDIO_CHAR_UUID,
+      NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
+  );
+  envAudioChar->setCallbacks(new AudioDataCallbacks());
+#endif
+
+  if (envService->start())
+    Serial.println("BLE server started");
+  else
+  {
+    Serial.println("BLE server failed to start, aborting");
+    return; // failed to start server, abort
+  }
+  Serial.println(">>-------------------------------------------------------------------------------------");
+
+  // now start advertising
+  Serial.println("BLE advertising init");
+  // Configure and Start Advertising
+  pAdvertising = NimBLEDevice::getAdvertising();
+  if (!pAdvertising->addServiceUUID(SERVICE_UUID))
+  {
+    Serial.println("Advertising failed to add Service UUID, abort");
+    return;
+  }
+  pAdvertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
+  pAdvertising->enableScanResponse(true);
+  pAdvertising->setName(finalDeviceName);
+  Serial.printf("BLE advertising starting on %s\n", SERVICE_UUID);
+  if (pAdvertising->start())
+  {
+    Serial.println("Advertising started successfully");
+  }
+  else
+  {
+    Serial.println("Advertising failed to start!, abort");
+    return;
+  }
+  Serial.printf("TilauScope Ambiant BLE service now fully ready, answer on nName: %s\n", finalDeviceName.c_str());
+  Serial.println(">>-------------------------------------------------------------------------------------");
+};
+
+// --- Loop ---
+void loop()
+{
+  // LED Blinking Management (Non-blocking)
+  unsigned long currentMillis = millis();
+  if ((monitorTaskHandle == NULL) && (audioStarted && isCalibrated))
+  {
+    Serial.println("Starting Monitor Audio Task...");
+    BaseType_t xReturned = xTaskCreatePinnedToCore(
+        monitorAudioTask,
+        "MonitorAudioTask",
+        12288,
+        NULL,
+        2,
+        &monitorTaskHandle,
+        1);
+    if (xReturned != pdPASS)
+    {
+      Serial.println("Failed to create Monitor Task!");
+    }
+  }
+  if (!deviceConnected)
+  {
+    // If device is not connected, blink the LED (indicates advertising/ready state)
+    if (currentMillis - previousMillis >= BLINK_INTERVAL)
+    {
+      // Save the current time
+      previousMillis = currentMillis;
+      // Toggle the LED state
+      int ledState = digitalRead(LED_PIN);
+      digitalWrite(LED_PIN, !ledState);
+    }
+  }
+  else
+  {
+    // A device is connected: keep the LED ON steadily
+    digitalWrite(LED_PIN, HIGH);
+  }
+}
