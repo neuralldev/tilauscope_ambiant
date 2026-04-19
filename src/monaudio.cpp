@@ -16,6 +16,8 @@ SD (DOUT)	  GPIO 32	  Données
 L/R	        GND	      Canal gauche (Left)
 */
 
+static portMUX_TYPE crack_mux = portMUX_INITIALIZER_UNLOCKED;
+
 bool crackCounterStatus = false; // true = running, false = not running
 bool isCalibrated = false;       // true = calibration has been done and finished ok, false=calibraton not done, skip counting
 bool audioStarted = false;       // true = audio correctly initialized, false = not initialized, therefore no feature working
@@ -51,8 +53,6 @@ typedef struct __attribute__((packed))
 float filter_state[2] = {0, 0};
 float coeffs[5];
 
-AudioStats stats = {0, 0.0f, 0.0f, 0.1f};
-
 static float fft_input[BUFFER_SIZE * 2]; // La FFT demande un buffer complexe (réel + imaginaire)
 static float fft_window[BUFFER_SIZE];
 static float fft_output[BUFFER_SIZE];
@@ -61,14 +61,178 @@ static float fft_output[BUFFER_SIZE];
 float noise_std_dev = 0; // Écart-type (stabilité du bruit)
 float signal_to_noise_estimated = 0;
 
-void calibrateTask(void *pvParameters)
+AudioStats stats = {0, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f};
+
+#define HISTO_BINS    200        // résolution de l'histogramme
+#define HISTO_MAX_AMP 0.5f       // amplitude max attendue pour le bruit
+
+
+void calibrateTask(void *pvParameters) {
+    float sum_rms    = 0;
+    float sum_sq_rms = 0;
+    int   count      = 0;
+    float peak_during_calib = 0;
+
+    // --- Histogramme des amplitudes sample par sample ---
+    uint32_t histo[HISTO_BINS] = {0};
+    uint32_t total_samples = 0;
+
+    calibrating = true;
+    Serial.println("\n>>> Calibration - Stay quiet!");
+
+    unsigned long start = millis();
+    unsigned long last_ui_update = 0;
+
+    while (millis() - start < CALIB_TIME_MS) {
+        int32_t raw[BUFFER_SIZE];
+        size_t bytesRead = 0;
+        esp_err_t result = i2s_read(I2S_PORT, raw, sizeof(raw), &bytesRead, portMAX_DELAY);
+
+        if (result == ESP_OK && bytesRead > 0) {
+            int n = bytesRead / sizeof(int32_t);
+            float current_sum_sq = 0;
+            float local_peak = 0;
+
+            for (int i = 0; i < n; i++) {
+                float s = (float)(raw[i] >> 8) / 8388608.0f;
+                float abs_s = fabsf(s);
+
+                // --- remplir l'histogramme ---
+                int bin = (int)(abs_s / HISTO_MAX_AMP * HISTO_BINS);
+                if (bin >= HISTO_BINS) bin = HISTO_BINS - 1;
+                histo[bin]++;
+                total_samples++;
+
+                current_sum_sq += s * s;
+                if (abs_s > local_peak) local_peak = abs_s;
+            }
+
+            if (local_peak > peak_during_calib) peak_during_calib = local_peak;
+            float current_rms = sqrtf(current_sum_sq / n);
+            sum_rms    += current_rms;
+            sum_sq_rms += current_rms * current_rms;
+            count++;
+
+            // UI update (inchangé)
+            if (millis() - last_ui_update > 200) {
+                last_ui_update = millis();
+                int progress = (millis() - start) * 20 / CALIB_TIME_MS;
+                int vu_len = (int)(local_peak * 40);
+                if (vu_len > 20) vu_len = 20;
+                Serial.print("\rProgress: [");
+                for (int i = 0; i < 20; i++) Serial.print(i < progress ? "#" : "-");
+                Serial.print("] Peak: ");
+                for (int i = 0; i < vu_len; i++) Serial.print(">");
+                for (int i = vu_len; i < 20; i++) Serial.print(" ");
+                Serial.printf(" (%.4f)", local_peak);
+                Serial.flush();
+            }
+        }
+        vTaskDelay(1);
+    }
+    Serial.println();
+
+    if (count == 0 || total_samples == 0) {
+        Serial.println("Calibration failed - no data");
+        isCalibrated = false;
+        calibrating  = false;
+        calibrateTaskHandle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // --- Calculs statistiques ---
+    stats.noise_floor_rms = sum_rms / count;
+    float variance = (sum_sq_rms / count) - (stats.noise_floor_rms * stats.noise_floor_rms);
+    float std_dev  = sqrtf(fmaxf(0.0f, variance));
+
+    // --- Percentiles depuis l'histogramme ---
+    // P99 = valeur dépassée par 1% des samples
+    // P999 = valeur dépassée par 0.1% des samples
+    uint32_t target_p99  = (uint32_t)(total_samples * 0.990f);
+    uint32_t target_p999 = (uint32_t)(total_samples * 0.999f);
+    float p99  = HISTO_MAX_AMP;  // fallback
+    float p999 = HISTO_MAX_AMP;
+    uint32_t cumul = 0;
+    bool found_p99 = false, found_p999 = false;
+
+    for (int b = 0; b < HISTO_BINS; b++) {
+        cumul += histo[b];
+        float bin_amp = ((float)b / HISTO_BINS) * HISTO_MAX_AMP;
+        if (!found_p99 && cumul >= target_p99) {
+            p99 = bin_amp;
+            found_p99 = true;
+        }
+        if (!found_p999 && cumul >= target_p999) {
+            p999 = bin_amp;
+            found_p999 = true;
+            break;
+        }
+    }
+
+    stats.noise_p99  = p99;
+    stats.noise_p999 = p999;
+    stats.peak_amplitude = peak_during_calib;
+
+    // --- Seuil adaptatif basé sur P99.9 + marge de sécurité ---
+    // On prend le max entre :
+    //   - P99.9 * 2.5  (marge sur la queue de distribution réelle)
+    //   - noise_rms * 8 (plancher minimum pour éviter un seuil trop bas)
+    float threshold_from_percentile = p999 * 2.5f;
+    float threshold_from_rms        = stats.noise_floor_rms * 8.0f;
+    stats.threshold = fmaxf(threshold_from_percentile, threshold_from_rms);
+
+    // --- SNR estimé ---
+    // On estime la puissance d'un crack typique à ~0.2 (valeur conservative)
+    float crack_ref_amp = 0.2f;
+    stats.snr_db = 20.0f * log10f(crack_ref_amp / fmaxf(stats.noise_floor_rms, 1e-9f));
+
+    // --- Rapport de calibration détaillé ---
+    Serial.println("========== CALIBRATION REPORT ==========");
+    Serial.printf("Samples collectés   : %u\n",   total_samples);
+    Serial.printf("Bruit RMS moyen     : %.6f\n", stats.noise_floor_rms);
+    Serial.printf("Écart-type RMS      : %.6f\n", std_dev);
+    Serial.printf("Pic max capturé     : %.6f\n", peak_during_calib);
+    Serial.printf("Percentile P99      : %.6f\n", p99);
+    Serial.printf("Percentile P99.9    : %.6f\n", p999);
+    Serial.printf("Seuil final         : %.6f\n", stats.threshold);
+    Serial.printf("  (from P99.9×2.5)  : %.6f\n", threshold_from_percentile);
+    Serial.printf("  (from RMS×8)      : %.6f\n", threshold_from_rms);
+    Serial.printf("SNR estimé          : %.1f dB\n", stats.snr_db);
+
+    // --- Alertes contextualisées ---
+    Serial.println("----------------------------------------");
+    if (stats.snr_db < 15.0f) {
+        Serial.println("⚠ SNR faible (<15dB) : détection peu fiable.");
+        Serial.println("  → Rapprocher le micro du grain, ou isoler des vibrations.");
+    } else if (stats.snr_db < 25.0f) {
+        Serial.println("~ SNR acceptable (15-25dB) : détection correcte.");
+        Serial.println("  → Résultats possibles, re-calibrer si faux positifs.");
+    } else {
+        Serial.println("✓ SNR bon (>25dB) : conditions optimales.");
+    }
+    if (p999 > 0.05f) {
+        Serial.println("⚠ Queue de distribution large : bruit impulsionnel présent.");
+        Serial.println("  → Vibrations mécaniques ? Seuil automatiquement relevé.");
+    }
+    Serial.println("========================================\n");
+
+    crack_counter = 0;
+    isCalibrated  = true;
+    saveCalibrationToFile();
+
+    calibrating = false;
+    calibrateTaskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
+void my_oldcalibrateTask(void *pvParameters)
 {
   float sum_rms = 0;
   float sum_sq_rms = 0;
   int count = 0;
   float peak_during_calib = 0;
   
-  calibrating = true;
   Serial.println("\n>>> Audio process - Calibrating... Stay quiet!");
   Serial.println("Progress: [--------------------]  Peak Amp");
 
@@ -154,7 +318,9 @@ void calibrateTask(void *pvParameters)
         Serial.println("QUALITÉ : Environnement stable et clair.");
     }
     Serial.println("-------------------------------\n");
+    portENTER_CRITICAL(&crack_mux);
     crack_counter = 0;
+    portEXIT_CRITICAL(&crack_mux);
     isCalibrated = true;
     saveCalibrationToFile();   
   }
@@ -174,11 +340,13 @@ void calibrate()
   }
   // locck access to calibration
   calibrating = true;
+  portENTER_CRITICAL(&crack_mux);
   crack_counter = -1; // during calibration, set to -1 to indicate not ready
+  portEXIT_CRITICAL(&crack_mux);
   Serial.println("Audio process - Starting Calibration Task...");
 
   // Create the task
-  xTaskCreatePinnedToCore(
+  BaseType_t res = xTaskCreatePinnedToCore(
       calibrateTask,        // Task function
       "CalibrateTask",      // Name for the task
       12288,                // Stack size (increase if needed)
@@ -187,6 +355,13 @@ void calibrate()
       &calibrateTaskHandle, // Task handle (for referencing)
       1                     // Core to run on (Core 1 is good for non-BLE/WiFi tasks)
   );
+  if (res != pdPASS) {
+    Serial.println("Failed to create calibrate task!");
+    calibrating = false;  // ← libérer le verrou
+    portENTER_CRITICAL(&crack_mux);
+    crack_counter = 0;
+    portEXIT_CRITICAL(&crack_mux);
+  } 
 }
 
 void initFFT() {
@@ -291,7 +466,9 @@ void monitorAudioTask(void *pvParameters)
 
       // Lecture des données I2S
       esp_err_t result = i2s_read(I2S_PORT, static_cast<void *>(raw), sizeof(raw), &bytesRead, portMAX_DELAY);
-      
+
+      bool crack_in_buffer = false;
+
       if (result == ESP_OK && bytesRead > 0)
       {
         int n = bytesRead / sizeof(int32_t);
@@ -317,7 +494,7 @@ void monitorAudioTask(void *pvParameters)
           if (current_amp > max_observed) max_observed = current_amp;
           static uint32_t last_report = 0;
           if (millis() - last_report > 2000) {
-            static float delta = abs((current_amp - stats.threshold)/stats.threshold);
+            float delta = abs((current_amp - stats.threshold)/stats.threshold);
             Serial.printf("delta: %.0f% Noise: %.4f | Treshold: %.4f | Max pike: %.4f\n", 
                           delta*100.0f, current_amp, stats.threshold, max_observed);
             if (delta <= 0.1f) {
@@ -327,25 +504,30 @@ void monitorAudioTask(void *pvParameters)
             max_observed = 0; 
           }
           // end diagnostic
-
           // Comparaison avec le seuil calculé lors de la calibration
           if (amp > stats.threshold && amp > (last_amp * 3.0f))
           {
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            
+//            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_crack_time) > pdMS_TO_TICKS(DSP_DEAD_TIME_MS))            
             // Gestion du temps mort (Dead Time) pour éviter les doubles comptages d'un même son
-            if (now - last_crack_time > DSP_DEAD_TIME_MS)
+//            if (now - last_crack_time > DSP_DEAD_TIME_MS)
             {
+              portENTER_CRITICAL(&crack_mux);
               crack_counter++;
-              stats.crack_count = crack_counter; // Mise à jour de la structure stats
+              int16_t val = crack_counter;
+              portEXIT_CRITICAL(&crack_mux);
+              crack_in_buffer = true;
+              stats.crack_count = val; // Mise à jour de la structure stats
               if (amp > stats.peak_amplitude)
                 stats.peak_amplitude = amp;
               last_crack_time = now;
               analyzeFrequency(output_f, n);
-              Serial.printf("- mon - crack detected! count=%d amp=%.4f\n", crack_counter, amp);
+              Serial.printf("- mon - crack detected! count=%d amp=%.4f\n", val, amp);
             }
           }
         }
+        if (crack_in_buffer) analyzeFrequency(output_f, n);
       }
       if (++check_count >= 100) {
           uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
@@ -366,13 +548,18 @@ void monitorAudioTask(void *pvParameters)
     // Petite pause pour laisser les autres tâches (BLE/System) respirer
     vTaskDelay(1); 
   }
+  monitorTaskHandle = NULL;
+  vTaskDelete(NULL);
 }
 
 void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
 {
   AudioData data;
   // Read or simulate data
-  data.crack_count = (!isCalibrated || !audioStarted ? -1 : crack_counter);
+  portENTER_CRITICAL(&crack_mux);
+  int16_t val = crack_counter;
+  portEXIT_CRITICAL(&crack_mux);
+  data.crack_count = (!isCalibrated || !audioStarted ? -1 : val);
   // Calculate checksum over the data payload (excluding header and footer)
   // The payload starts right after the header field
   const uint8_t *payloadPtr = reinterpret_cast<const uint8_t *>(&data) + sizeof(data.header);
@@ -382,7 +569,7 @@ void AudioDataCallbacks::onRead(NimBLECharacteristic *pCharacteristic, NimBLECon
   // Set the characteristic value with the entire structure
   pCharacteristic->setValue(reinterpret_cast<uint8_t *>(&data), sizeof(AudioData));
   // Print current values to the Serial Monitor
-  Serial.printf("on read received - crack counter: %d crack(s)\n", (float)data.crack_count);
+  Serial.printf("on read received - crack counter: %d crack(s)\n", (int)data.crack_count);
 }
 
 void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
@@ -426,14 +613,22 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
   {
   case COMMAND_RUNCALIBRATION:
     crackCounterStatus = false; // Example use of a global state variable
+    portENTER_CRITICAL(&crack_mux);
     crack_counter = -1;
+    portEXIT_CRITICAL(&crack_mux);
+
     calibrate();
     break;
   case COMMAND_START_SAMPLING:
     if (isCalibrated)
     {
-      crackCounterStatus = true;
-      crack_counter = 0;
+      if (!crackCounterStatus) {          // ← seulement si pas déjà démarré
+            crackCounterStatus = true;
+        portENTER_CRITICAL(&crack_mux);
+        crack_counter = 0;
+        portEXIT_CRITICAL(&crack_mux);
+            Serial.println("Audio process - start Sampling/Counting");
+        }
       Serial.println("Audio process - start Sampling/Counting");
     }
     break;
@@ -509,6 +704,9 @@ bool saveCalibrationToFile()
   doc["noise_floor_rms"] = stats.noise_floor_rms;
   doc["threshold"] = stats.threshold;
   doc["isCalibrated"] = true; // Sauvegarder l'état de calibration
+  doc["noise_p99"]  = stats.noise_p99;
+  doc["noise_p999"] = stats.noise_p999;
+  doc["snr_db"]     = stats.snr_db;
 
   Serial.printf("Audio process - Saving calibration to %s...\n", CALIBRATION_FILE);
 
@@ -570,9 +768,20 @@ bool loadCalibrationFromFile()
 
   // Assignation des valeurs globales
   stats.noise_floor_rms = doc["noise_floor_rms"].as<float>();
-  stats.threshold = doc["threshold"].as<float>();
+  float t = doc["threshold"].as<float>();
+  if (t <= 0.0f || isnan(t) || isinf(t)) {
+      Serial.println("Invalid threshold in calibration file");
+      return false;
+  }
+  stats.threshold = t;
+//  stats.threshold = doc["threshold"].as<float>();
   stats.peak_amplitude = doc["peak_amplitude"].as<float>();
   isCalibrated = doc["isCalibrated"].as<bool>();
+
+  stats.noise_p99  = doc["noise_p99"].as<float>();  // | 0.0f = valeur par défaut
+  stats.noise_p999 = doc["noise_p999"].as<float>();  // si clé absente (ancien fichier)
+  stats.snr_db     = doc["snr_db"].as<float>();     // si clé absente (ancien fichier)
+
 
   Serial.printf("Audio process - Calibration loaded from file: floor=%.2f, Threshold=%.2f, peak=%.2f\n",
                 stats.noise_floor_rms, stats.threshold, stats.peak_amplitude);

@@ -34,7 +34,7 @@ NimBLEAdvertising *pAdvertising;   // Pointer to the BLE Advertising object
 bool deviceConnected = false;
 unsigned long previousMillis = 0;  // For non-blocking timing (LED blink)
 unsigned long previousMillis1 = 0; // For non-blocking tempo display
-int simulation = false;            // Flag to indicate if simulation mode is active (sensor failure)
+bool simulation = false;            // Flag to indicate if simulation mode is active (sensor failure)
 bool previous = true;              // used in test mode only
 
 Adafruit_Sensor *bme_temp;
@@ -366,6 +366,7 @@ void setup()
   else
   {
     Serial.println("BLE init failed, abort setup");
+    audioStarted = false;
     return; // stop initialization as there is no radio
   }
   NimBLEServer *server = NimBLEDevice::createServer();

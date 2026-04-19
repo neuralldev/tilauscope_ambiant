@@ -27,6 +27,9 @@ struct AudioStats {
     float peak_amplitude;
     float noise_floor_rms;
     float threshold;
+    float noise_p999;       // percentile 99.9% des amplitudes de bruit
+    float noise_p99;        // percentile 99% 
+    float snr_db;           // SNR estimé en dB
 };
 
 extern AudioStats stats;
