@@ -313,7 +313,9 @@ void setup()
     }
     else
     { // configure DSP filter
-      err = dsps_biquad_gen_bpf0db_f32(coeffs, CUTTFOFF_FREQ / float(I2S_SAMPLE_RATE), 0.707f);
+      // FIX : passe-bande centré 2500 Hz, Q=1.2 (~bande 1.5–4 kHz couvrant les fréquences de crack)
+      // dsps_biquad_gen_bpf_f32 génère un vrai BPF avec gain non-nul (vs bpf0db 0 dB peak)
+      err = dsps_biquad_gen_bpf_f32(coeffs, BPF_CENTER_FREQ / float(I2S_SAMPLE_RATE), BPF_Q);
       if (err == ESP_OK)
       {
         audioStarted = true;
@@ -321,7 +323,7 @@ void setup()
       }
       else
       {
-        Serial.printf("Erreur dsps_biquad_gen_bpf0db_f32: %d\n", err);
+        Serial.printf("Erreur dsps_biquad_gen_bpf_f32: %d\n", err);
         audioStarted = false;
       }
     }
@@ -355,6 +357,14 @@ void setup()
   else
   {
     Serial.println("File system mounted successfully.");
+  }
+
+  // FIX #9 : tentative de chargement de la calibration existante au boot
+  // Evite une recalibration si l'ESP32 redémarre en cours de torréfaction
+  if (loadCalibrationFromFile()) {
+    Serial.println("Boot calibration restored from file - ready to START without CAL.");
+  } else {
+    Serial.println("No valid calibration on file - send CAL command before START.");
   }
 #endif
 
