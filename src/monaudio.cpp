@@ -208,12 +208,22 @@ void calibrateTask(void *pvParameters)
         }
     }
 
+    // LOG HISTO pour analyse externe (Python analysecrack.py)
+    if (audioDebugEnabled) {
+        Serial.print("HISTO_DATA [");
+        for (int b = 0; b < HISTO_BINS; b++) {
+            Serial.print(histo[b]);
+            if (b < HISTO_BINS - 1) Serial.print(",");
+        }
+        Serial.println("]");
+    }
+
     stats.noise_p99      = p99;
     stats.noise_p999     = p999;
     stats.peak_amplitude = peak_during_calib;
 
     // Seuil adaptatif : max(P99.9 × 2.5 , RMS × 8)
-    float threshold_from_percentile = p999 * 2.5f;
+    float threshold_from_percentile = p999 * 1.5f;
     float threshold_from_rms        = stats.noise_floor_rms * 8.0f;
     stats.threshold = fmaxf(threshold_from_percentile, threshold_from_rms);
 
@@ -334,6 +344,21 @@ void analyzeFrequency(float *data, int n)
     float max_crack_energy = 0.0f;
     float total_energy    = 0.0f;
 
+    // Pré-calcul des énergies par bandes pour analysecrack.py
+    float band_low = 0, band_mid = 0, band_high = 0;
+    for (int i = 0; i < fft_n / 2; i++) {
+        float freq = i * bin_width;
+        float mag = fft_output[i];
+        total_energy += mag;
+        if (freq < 1500.0f) band_low += mag;
+        else if (freq <= 4000.0f) {
+            band_mid += mag;
+            float v = mag * 25000.0f;
+            if (v > max_crack_energy) max_crack_energy = v;
+        }
+        else if (freq < 8000.0f) band_high += mag;
+    }
+
     // Spectre global (0 – 5 kHz)
     Serial.print("\nGlobal : ");
     for (int i = 0; i < fft_n / 2; i += 3) {
@@ -343,7 +368,6 @@ void analyzeFrequency(float *data, int n)
         if      (val > 10.0f) Serial.print("H");
         else if (val >  2.0f) Serial.print("x");
         else                  Serial.print(".");
-        total_energy += fft_output[i];
     }
 
     // Focus zone crack (1.5–4 kHz)
@@ -355,13 +379,18 @@ void analyzeFrequency(float *data, int n)
             float val = fft_output[i] * 25000.0f;
             if (val > 5.0f) {
                 Serial.print("^");
-                if (val > max_crack_energy) max_crack_energy = val;
             } else {
                 Serial.print(" ");
             }
         } else {
             Serial.print(" ");
         }
+    }
+
+    // LOG FREQ parseable
+    if (audioDebugEnabled) {
+        Serial.printf("\nFREQ_DATA t=%lu peak_e=%.4f tot_e=%.4f low=%.4f mid=%.4f high=%.4f\n",
+                      millis(), max_crack_energy, total_energy, band_low, band_mid, band_high);
     }
 
     // Barre d'intensité
@@ -443,13 +472,8 @@ void monitorAudioTask(void *pvParameters)
                 // FIX #8 : last_report_ms est static hors boucle — un seul appel millis() ici
                 uint32_t now_ms = millis();
                 if (audioDebugEnabled && (now_ms - last_report_ms > 2000)) {
-                    // FIX #8 : format string corrigé (%% pour le signe %)
-                    float delta = fabsf((max_observed - stats.threshold) / stats.threshold);
-                    Serial.printf("Debug | Noise max: %.4f | Threshold: %.4f | Max peak: %.4f | Delta: %.0f%%\n",
-                                  max_observed, stats.threshold, max_observed, delta * 100.0f);
-                    if (delta <= 0.1f) {
-                        Serial.println("Warning: Ambient noise close to threshold, consider re-calibrating.");
-                    }
+                    Serial.printf("STATUS t=%lu thr=%.4f noise_max=%.4f snr=%.1f cracks=%u\n",
+                                  now_ms, stats.threshold, max_observed, stats.snr_db, stats.crack_count);
                     last_report_ms = now_ms;
                     max_observed   = 0.0f;
                 }
@@ -458,15 +482,27 @@ void monitorAudioTask(void *pvParameters)
                 static float last_amp    = 0.0f;
                 bool         crack_found = false;
 
+                // Statistiques par buffer pour log d'analyse
+                float buf_peak           = 0.0f;
+                float buf_rms_sq         = 0.0f;
+                int   near_miss_thr      = 0;      // dépasse seuil mais front trop doux
+                int   near_miss_rise     = 0;      // front abrupt mais sous le seuil
+                float near_miss_thr_amp  = 0.0f;
+                float near_miss_rise_amp = 0.0f;
+
                 for (int i = 0; i < n; i++)
                 {
                     float amp = fabsf(output_f[i]);
 
-                    // Mise à jour du pic pour diagnostic (toujours, pas seulement en debug)
                     if (amp > max_observed) max_observed = amp;
+                    if (amp > buf_peak)     buf_peak     = amp;
+                    buf_rms_sq += amp * amp;
 
-                    // Condition : dépasse le seuil ET est un front montant net (×3 vs dernier)
-                    if (amp > stats.threshold && amp > (last_amp * 3.0f))
+                    bool over_threshold = (amp > stats.threshold);
+                    bool sharp_rise     = (amp > last_amp * 3.0f);
+
+                    // Condition : dépasse le seuil ET front montant net (x3)
+                    if (over_threshold && sharp_rise)
                     {
                         TickType_t now_ticks = xTaskGetTickCount();
                         if ((now_ticks - last_crack_time) > pdMS_TO_TICKS(DSP_DEAD_TIME_MS))
@@ -482,12 +518,47 @@ void monitorAudioTask(void *pvParameters)
                             last_crack_time = now_ticks;
                             crack_found     = true;
 
-                            Serial.printf("- mon - CRACK #%d amp=%.4f threshold=%.4f\n",
-                                          val, amp, stats.threshold);
+                            // LOG CRACK parseable
+                            Serial.printf("CRACK t=%lu n=%d amp=%.4f thr=%.4f rise=%.2f\n",
+                                          millis(), val, amp, stats.threshold,
+                                          (last_amp > 0.0001f) ? amp / last_amp : 0.0f);
+                        }
+                        else if (audioDebugEnabled)
+                        {
+                            Serial.printf("CRACK_SKIP t=%lu amp=%.4f dead_ms=%ld\n",
+                                          millis(), amp,
+                                          (long)(pdMS_TO_TICKS(DSP_DEAD_TIME_MS) -
+                                                 (xTaskGetTickCount() - last_crack_time)) *
+                                                portTICK_PERIOD_MS);
                         }
                     }
+                    else if (over_threshold && !sharp_rise && audioDebugEnabled)
+                    {
+                        // Dépasse seuil mais front trop progressif — faux négatif potentiel
+                        near_miss_thr++;
+                        if (amp > near_miss_thr_amp) near_miss_thr_amp = amp;
+                    }
+                    else if (!over_threshold && sharp_rise && amp > stats.threshold * 0.5f && audioDebugEnabled)
+                    {
+                        // Front abrupt mais sous le seuil — seuil peut-être trop haut
+                        near_miss_rise++;
+                        if (amp > near_miss_rise_amp) near_miss_rise_amp = amp;
+                    }
+
                     last_amp = amp;
                 }
+
+                // LOG BUF — une ligne par buffer (base de l'analyse)
+                float buf_rms = sqrtf(buf_rms_sq / n);
+                Serial.printf("BUF t=%lu cnt=%u peak=%.4f rms=%.4f thr=%.4f snr=%.1f",
+                              millis(), stats.crack_count, buf_peak, buf_rms, stats.threshold,
+                              20.0f * log10f(buf_peak / fmaxf(stats.noise_floor_rms, 1e-9f)));
+                if (audioDebugEnabled && (near_miss_thr > 0 || near_miss_rise > 0)) {
+                    Serial.printf(" nm_thr=%d(%.4f) nm_rise=%d(%.4f)",
+                                  near_miss_thr, near_miss_thr_amp,
+                                  near_miss_rise, near_miss_rise_amp);
+                }
+                Serial.println();
 
                 // FIX #1 : analyzeFrequency appelée UNE SEULE FOIS après la boucle
                 if (crack_found) {

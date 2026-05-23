@@ -8,13 +8,15 @@
 #include <algorithm>   // Used for string manipulation (std::remove)
 #include <string>
 #include <cmath> // Used for simulation functions (sin, cos)
-// #include <esp_system.h> // Include this header at the top of main.cpp
+// #include <esp_system.h>
+#include "esp_log.h" // Include this header at the top of main.cpp
 #include "common.h"
 #include "monaudio.h"
 
 // --- Definitions ---
 // Standard atmospheric pressure at sea level in hPa (used for altitude calculation)
-#define SEALEVELPRESSURE_HPA (1013.25)
+// Pour recalibrer : p_sea = p_local / (1 - alt_NGF/44330)^5.255
+#define SEALEVELPRESSURE_HPA (1016.6)
 // BLE Service UUID for the environmental data service
 #define SERVICE_UUID "f3b6e2A0-8c4e-4e1f-9c2d-1a7f5b9a1c01"
 // BLE Characteristic UUID for the environmental data
@@ -170,6 +172,11 @@ class ServerCallbacks : public NimBLEServerCallbacks
 void setup()
 {
   Serial.begin(115200);
+  // Activer le niveau DEBUG pour le tag AUDIO sur le port debug-console
+  // Permet de voir ESP_LOGD(TAG_MON, ...) depuis /dev/cu.debug-console
+  esp_log_level_set("AUDIO", ESP_LOG_DEBUG);
+  esp_log_level_set("CAL",   ESP_LOG_DEBUG);
+  esp_log_level_set("MON",   ESP_LOG_DEBUG);
   Serial.println(">>-------------------------------------------------------------------------------------");
   Serial.println("TilauScope Ambiant booting");
   Wire.begin(SDA_PIN, SCL_PIN);
