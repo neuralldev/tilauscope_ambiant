@@ -3,8 +3,7 @@
 #include <Adafruit_BME280.h>
 #include <NimBLEDevice.h>
 #include <numeric>
-#include <esp_netif.h> // Required for esp_netif_init() and esp_netif_create_default_wifi_sta()
-#include <esp_wifi.h>  // Required for esp_wifi_get_mac()
+#include <WiFi.h>   // Used only for MAC address to generate unique device name
 #include <algorithm>   // Used for string manipulation (std::remove)
 #include <string>
 #include <cmath> // Used for simulation functions (sin, cos)
@@ -171,7 +170,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
 // --- Setup ---
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(921600);
   // Activer le niveau DEBUG pour le tag AUDIO sur le port debug-console
   // Permet de voir ESP_LOGD(TAG_MON, ...) depuis /dev/cu.debug-console
   esp_log_level_set("AUDIO", ESP_LOG_DEBUG);
@@ -229,47 +228,10 @@ void setup()
   digitalWrite(LED_PIN, LOW); // Ensure LED is off initially
   Serial.println("LED configured to blink every second");
 
-  uint8_t mac[6];
-  char macStr[18] = {0};
-
-  // Initialise Netif
-  esp_err_t err = esp_netif_init();
-  if (err == ESP_OK)
-  {
-    Serial.println("tcp/ip stack initialized");
-  }
-  else
-  {
-    Serial.println("tcp/ip stack initialization failed");
-  }
-
-  // Initialise Wi-Fi
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  err = esp_wifi_init(&cfg);
-  if (err == ESP_OK)
-  {
-    Serial.println("WiFi driver initialized");
-  }
-  else
-  {
-    Serial.printf("WiFi driver initialization failed: %d\n", err);
-  }
-
-  // get mac address
-  err = esp_wifi_get_mac(WIFI_IF_STA, mac);
-  if (err == ESP_OK)
-  {
-    Serial.println("MAC address fetched from Wifi chipset");
-  }
-  else
-  {
-    Serial.printf("MAC retrieval failed: %d\n", err);
-  }
-  // remove wifi driver to free radio for BLE
-  esp_wifi_deinit();
-  Serial.println("WiFi driver de-initialized (radio freed)");
-  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  std::string macFull = macStr;
+  // Disable WiFi to free the radio for BLE — the MAC stays readable from efuse
+  WiFi.mode(WIFI_MODE_NULL);
+  delay(100);
+  std::string macFull = WiFi.macAddress().c_str();
   // generate unique name based on MAC address
   std::string identifier = macFull.substr(macFull.length() - 8);
   identifier.erase(std::remove(identifier.begin(), identifier.end(), ':'), identifier.end());
@@ -284,13 +246,15 @@ void setup()
 
   // now working on audio threads
   // set I2S default values for acquiring 24 bits data from microphone
+  esp_err_t err = ESP_OK;
 
   i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = I2S_SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,      // <-- Assurer 32 bits
-      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,      // ou ONLY_RIGHT selon votre L/R pin
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      .intr_alloc_flags = 0,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // <-- Assurer mono (canal gauche)
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      
+      .intr_alloc_flags = 0,
       .dma_buf_count = 8,
       .dma_buf_len = 256,
       .use_apll = false,
@@ -393,7 +357,7 @@ void setup()
   NimBLEService *envService = server->createService(SERVICE_UUID);
   envDataChar = envService->createCharacteristic(
       ENV_DATA_CHAR_UUID,
-      NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
+      NIMBLE_PROPERTY::READ // The characteristic is only readable by the client
   );
   envDataChar->setCallbacks(new EnvironmentDataCallbacks());
 
@@ -401,7 +365,7 @@ void setup()
 #if defined(TILAUONAUDIO_H)
   envAudioChar = envService->createCharacteristic(
       ENV_AUDIO_CHAR_UUID,
-      NIMBLE_PROPERTY::READ | WRITE // The characteristic is only readable by the client
+      NIMBLE_PROPERTY::READ | WRITE // READ : crack counter | WRITE : commandes audio
   );
   envAudioChar->setCallbacks(new AudioDataCallbacks());
 #endif

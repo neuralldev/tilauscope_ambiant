@@ -65,15 +65,19 @@ extern float filter_state[2];
 #define COMMAND_CALIBRATIONSTATE    0x0003
 #define COMMAND_SAMPLINGSTATUS      0x0004
 #define COMMAND_GETCRACKCOUNTER     0x0005
-#define COMMAND_RAISERATIO          0x0006
-#define COMMAND_DECREASERATIO       0x0007
-#define COMMAND_RAISERATIO5         0x0506
-#define COMMAND_DECREASERATIO5      0x0507
 #define COMMAND_DEBUG_ON            0x0010  // Active la verbosité série étendue
 #define COMMAND_DEBUG_OFF           0x0011  // Désactive la verbosité série étendue
 
 // UUID de la caractéristique BLE audio
 #define ENV_AUDIO_CHAR_UUID  "f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c04"
+
+#define HOP            (FFT_SIZE/2)   // 128 samples = 8 ms @16k (50% overlap)
+#define FLUX_F_LO      1000.0f        // bande de flux (Hz)
+#define FLUX_F_HI      6000.0f
+#define FLUX_ALPHA     0.02f          // EMA du plancher de flux (τ≈0.4 s)
+#define CREST_MIN      4.0f           // gate d'impulsivité (~12 dB)
+#define WARMUP_FRAMES 60           // (alternative basée sur le nombre de frames, pour plus de cohérence lors de l'ajout du BLE ratio adjust)
+// K (multiplicateur du seuil) devient runtime pour les commandes BLE ratio :
 
 extern NimBLECharacteristic* envAudioChar;
 extern TaskHandle_t monitorTaskHandle;

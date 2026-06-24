@@ -134,8 +134,8 @@ If the device fails to initialize the BME280 sensor (e.g., wiring error or senso
 |-----------|----------|-------------------|
 |VDD        | 3.3 V    | Power             |       Yellow    WS                   VDD  Red
 |GND        | GND      | Ground            |
-|WS (LRCL)  | GPIO 10  | Word Select       |       Orange    SCK    MICROPHONE     SD  Black
-|SCK (BCLK) | GPIO 11  | Bit Clock         |
+|WS (LRCL)  | GPIO 32  | Word Select       |       Orange    SCK    MICROPHONE     SD  Black
+|SCK (BCLK) | GPIO 33  | Bit Clock         |
 |SD (DOUT)  | GPIO 25  | Data              |               ------  FACE VIEW ------
 |L/R        | GND      | Left channel only |
 

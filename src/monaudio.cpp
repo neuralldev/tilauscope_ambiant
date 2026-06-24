@@ -30,6 +30,7 @@ volatile bool isCalibrated       = false;
 volatile bool audioStarted       = false;
 volatile bool calibrating        = false;
 volatile bool audioDebugEnabled  = false;  // activé via COMMAND_DEBUG_ON
+volatile float fluxK = 5.0f;          // thr = base + fluxK * dev
 
 NimBLECharacteristic *envAudioChar = nullptr;
 
@@ -79,7 +80,6 @@ float coeffs[5];
 // ---------------------------------------------------------------------------
 static float fft_input[FFT_SIZE * 2];   // complexe : réel + imaginaire entrelacés
 static float fft_window[FFT_SIZE];
-static float fft_output[FFT_SIZE];
 
 // ---------------------------------------------------------------------------
 // Stats de calibration
@@ -111,7 +111,7 @@ void calibrateTask(void *pvParameters)
     unsigned long start         = millis();
     unsigned long last_ui_update = 0;
 
-    // FIX #10 : raw alloué en heap DMA pour éviter de consommer 4 Ko de stack
+    // FIX #10 : raw alloué en heap DMA (NE PAS supprimer — utilisé par i2s_read)
     int32_t *raw = (int32_t *)heap_caps_malloc(BUFFER_SIZE * sizeof(int32_t), MALLOC_CAP_DMA);
     if (!raw) {
         Serial.println("Calibration: heap alloc failed, abort.");
@@ -120,6 +120,19 @@ void calibrateTask(void *pvParameters)
         vTaskDelete(NULL);
         return;
     }
+
+    // Same band-pass as detection, so calibration stats live on the FILTERED scale
+    float *cin  = (float *)heap_caps_malloc(BUFFER_SIZE * sizeof(float), MALLOC_CAP_DEFAULT);
+    float *cout = (float *)heap_caps_malloc(BUFFER_SIZE * sizeof(float), MALLOC_CAP_DEFAULT);
+    if (!cin || !cout) {
+        Serial.println("Calibration: filter buffer alloc failed, abort.");
+        heap_caps_free(raw);
+        heap_caps_free(cin);
+        heap_caps_free(cout);
+        calibrating = false; calibrateTaskHandle = NULL;
+        vTaskDelete(NULL); return;
+    }
+    float calib_fstate[2] = {0.0f, 0.0f};   // local biquad state (do not touch the detection one)
 
     while (millis() - start < CALIB_TIME_MS) {
         size_t    bytesRead = 0;
@@ -131,16 +144,21 @@ void calibrateTask(void *pvParameters)
             float current_sum_sq  = 0.0f;
             float local_peak      = 0.0f;
 
+            for (int i = 0; i < n; i++)
+                cin[i] = (float)(raw[i] >> 8) / 8388608.0f;
+
+            // identical filter to monitorAudioTask — threshold must match detection scale
+            dsps_biquad_f32_ansi(cin, cout, n, coeffs, calib_fstate);
+
             for (int i = 0; i < n; i++) {
-                float s     = (float)(raw[i] >> 8) / 8388608.0f;
-                float abs_s = fabsf(s);
+                float abs_s = fabsf(cout[i]);
 
                 int bin = (int)(abs_s / HISTO_MAX_AMP * HISTO_BINS);
                 if (bin >= HISTO_BINS) bin = HISTO_BINS - 1;
                 histo[bin]++;
                 total_samples++;
 
-                current_sum_sq += s * s;
+                current_sum_sq += cout[i] * cout[i];
                 if (abs_s > local_peak) local_peak = abs_s;
             }
 
@@ -170,6 +188,8 @@ void calibrateTask(void *pvParameters)
     Serial.println();
 
     heap_caps_free(raw);
+    heap_caps_free(cin);
+    heap_caps_free(cout);
 
     if (count == 0 || total_samples == 0) {
         Serial.println("Calibration failed - no data");
@@ -222,7 +242,7 @@ void calibrateTask(void *pvParameters)
     stats.noise_p999     = p999;
     stats.peak_amplitude = peak_during_calib;
 
-    // Seuil adaptatif : max(P99.9 × 2.5 , RMS × 8)
+    // Seuil adaptatif : max(P99.9 × 1.5 , RMS × 8)
     float threshold_from_percentile = p999 * 1.5f;
     float threshold_from_rms        = stats.noise_floor_rms * 8.0f;
     stats.threshold = fmaxf(threshold_from_percentile, threshold_from_rms);
@@ -240,7 +260,7 @@ void calibrateTask(void *pvParameters)
     Serial.printf("Percentile P99      : %.6f\n", p99);
     Serial.printf("Percentile P99.9    : %.6f\n", p999);
     Serial.printf("Seuil final         : %.6f\n", stats.threshold);
-    Serial.printf("  (from P99.9x2.5)  : %.6f\n", threshold_from_percentile);
+    Serial.printf("  (from P99.9x1.5)  : %.6f\n", threshold_from_percentile);
     Serial.printf("  (from RMSx8)      : %.6f\n", threshold_from_rms);
     Serial.printf("SNR estime          : %.1f dB\n", stats.snr_db);
     Serial.println("----------------------------------------");
@@ -312,95 +332,15 @@ void calibrate()
 // ---------------------------------------------------------------------------
 // initFFT — FIX #3 : utilise FFT_SIZE (256) au lieu de BUFFER_SIZE (1024)
 // ---------------------------------------------------------------------------
-void initFFT()
+esp_err_t initFFT()
 {
-    dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    esp_err_t err = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    if (err != ESP_OK) {
+        Serial.printf("initFFT: dsps_fft2r_init_fc32 failed: %d\n", err);
+        return err;
+    }
     dsps_wind_hann_f32(fft_window, FFT_SIZE);
-}
-
-// ---------------------------------------------------------------------------
-// analyzeFrequency — FIX #3 : travaille sur FFT_SIZE points
-// FIX #1 : appelée une seule fois par buffer crack depuis monitorAudioTask
-// ---------------------------------------------------------------------------
-void analyzeFrequency(float *data, int n)
-{
-    // Si n > FFT_SIZE, on ne traite que les FFT_SIZE premiers samples
-    int fft_n = (n < FFT_SIZE) ? n : FFT_SIZE;
-
-    for (int i = 0; i < fft_n; i++) {
-        fft_input[i * 2 + 0] = data[i] * fft_window[i];
-        fft_input[i * 2 + 1] = 0.0f;
-    }
-    dsps_fft2r_fc32(fft_input, fft_n);
-    dsps_bit_rev_fc32(fft_input, fft_n);
-
-    for (int i = 0; i < fft_n / 2; i++) {
-        float re       = fft_input[i * 2 + 0];
-        float im       = fft_input[i * 2 + 1];
-        fft_output[i]  = sqrtf(re * re + im * im) / fft_n;
-    }
-
-    float bin_width       = (float)I2S_SAMPLE_RATE / fft_n;
-    float max_crack_energy = 0.0f;
-    float total_energy    = 0.0f;
-
-    // Pré-calcul des énergies par bandes pour analysecrack.py
-    float band_low = 0, band_mid = 0, band_high = 0;
-    for (int i = 0; i < fft_n / 2; i++) {
-        float freq = i * bin_width;
-        float mag = fft_output[i];
-        total_energy += mag;
-        if (freq < 1500.0f) band_low += mag;
-        else if (freq <= 4000.0f) {
-            band_mid += mag;
-            float v = mag * 25000.0f;
-            if (v > max_crack_energy) max_crack_energy = v;
-        }
-        else if (freq < 8000.0f) band_high += mag;
-    }
-
-    // Spectre global (0 – 5 kHz)
-    Serial.print("\nGlobal : ");
-    for (int i = 0; i < fft_n / 2; i += 3) {
-        float freq = i * bin_width;
-        if (freq > 5000.0f) break;
-        float val  = fft_output[i] * 15000.0f;
-        if      (val > 10.0f) Serial.print("H");
-        else if (val >  2.0f) Serial.print("x");
-        else                  Serial.print(".");
-    }
-
-    // Focus zone crack (1.5–4 kHz)
-    Serial.print("\nFocus  :           ");
-    for (int i = 0; i < fft_n / 2; i += 3) {
-        float freq = i * bin_width;
-        if (freq > 5000.0f) break;
-        if (freq >= 1500.0f && freq <= 4000.0f) {
-            float val = fft_output[i] * 25000.0f;
-            if (val > 5.0f) {
-                Serial.print("^");
-            } else {
-                Serial.print(" ");
-            }
-        } else {
-            Serial.print(" ");
-        }
-    }
-
-    // LOG FREQ parseable
-    if (audioDebugEnabled) {
-        Serial.printf("\nFREQ_DATA t=%lu peak_e=%.4f tot_e=%.4f low=%.4f mid=%.4f high=%.4f\n",
-                      millis(), max_crack_energy, total_energy, band_low, band_mid, band_high);
-    }
-
-    // Barre d'intensité
-    Serial.print("\nImpact : ");
-    int power = (int)(max_crack_energy * 4);
-    if (power > 40) power = 40;
-    Serial.print("[");
-    for (int j = 0; j < 40; j++) Serial.print(j < power ? "=" : " ");
-    Serial.printf("] +%.1f dB\n", 20.0f * log10f(max_crack_energy + 0.0001f));
-    Serial.println("--------------------------------------------------");
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,28 +348,18 @@ void analyzeFrequency(float *data, int n)
 // ---------------------------------------------------------------------------
 void monitorAudioTask(void *pvParameters)
 {
-    // FIX #10 : buffers statiques pour ne pas consommer la stack task
-    static float input_f[BUFFER_SIZE];
-    static float output_f[BUFFER_SIZE];
+    static float frame_raw[FFT_SIZE];        // sliding window (unfiltered) for FFT
+    static float frame_bp [FFT_SIZE];        // sliding window (band-passed) for crest
+    static float prev_mag [FFT_SIZE/2];      // previous magnitude spectrum (flux)
 
-    TickType_t last_crack_time      = 0;
-    bool       last_status_was_running = false;
-    UBaseType_t uxHighWaterMark;
-    static int  check_count         = 0;
+    if (initFFT() != ESP_OK) {
+        Serial.println("monitorAudioTask: FFT init failed, task aborted.");
+        monitorTaskHandle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
-    // Diagnostic : pic max observé depuis le dernier rapport debug
-    static float max_observed       = 0.0f;
-    // FIX #8 : last_report sorti de la boucle interne (était static local dans la boucle)
-    static uint32_t last_report_ms  = 0;
-
-    Serial.println("Audio process - Monitoring Task starting");
-    uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.printf("Free stack : %d words (4 bytes each)\n", uxHighWaterMark);
-
-    initFFT();
-
-    // FIX #10 : raw alloué en heap DMA, partagé pour tout le cycle de vie de la tâche
-    int32_t *raw = (int32_t *)heap_caps_malloc(BUFFER_SIZE * sizeof(int32_t), MALLOC_CAP_DMA);
+    int32_t *raw = (int32_t *)heap_caps_malloc(HOP * sizeof(int32_t), MALLOC_CAP_DMA);
     if (!raw) {
         Serial.println("monitorAudioTask: heap alloc failed, task aborted.");
         monitorTaskHandle = NULL;
@@ -437,162 +367,137 @@ void monitorAudioTask(void *pvParameters)
         return;
     }
 
+    const float bin_hz = (float)I2S_SAMPLE_RATE / FFT_SIZE;   // 62.5 Hz
+    const int   k_lo   = (int)(FLUX_F_LO / bin_hz);
+    const int   k_hi   = (int)(FLUX_F_HI / bin_hz);
+
+    float    flux_base = 0.0f, flux_dev = 0.0f, prev_flux = 0.0f;
+    uint32_t last_onset_ms = 0, t_start = 0, last_status = 0;
+    bool     was_counting = false;
+    uint32_t frames_seen = 0; 
+
+    // Infinite task: idle when not counting, never exit (else loop() respawns it).
     while (1)
     {
-        if (isCalibrated && crackCounterStatus)
-        {
-            // Réinitialisation état filtre à la (re)mise en route
-            if (!last_status_was_running) {
-                filter_state[0]        = 0.0f;
-                filter_state[1]        = 0.0f;
-                last_status_was_running = true;
-                Serial.println("Audio process - Monitor logic active");
+        // ---- OFF state ----
+        if (!crackCounterStatus) {
+            if (was_counting) {
+                Serial.printf("#TILAU_AUDIO stop ms=%lu cracks=%u\n", millis(), stats.crack_count);
+                was_counting = false;
             }
-
-            size_t    bytesRead = 0;
-            esp_err_t result    = i2s_read(I2S_PORT, raw,
-                                           BUFFER_SIZE * sizeof(int32_t),
-                                           &bytesRead, portMAX_DELAY);
-
-            if (result == ESP_OK && bytesRead > 0)
-            {
-                int n = bytesRead / sizeof(int32_t);
-
-                // Normalisation 24 bits → float [-1 ; 1]
-                for (int i = 0; i < n; i++) {
-                    input_f[i] = (float)(raw[i] >> 8) / 8388608.0f;
-                }
-
-                // FIX #1 filtre DSP : passe-bande centré 2500 Hz, Q=1.2
-                // (les coeffs sont générés dans setup() via dsps_biquad_gen_bpf_f32)
-                dsps_biquad_f32_ansi(input_f, output_f, n, coeffs, filter_state);
-
-                // FIX #5 diagnostic : rapport debug hors boucle sample, toutes les 2 s,
-                // conditionné au flag audioDebugEnabled
-                // FIX #8 : last_report_ms est static hors boucle — un seul appel millis() ici
-                uint32_t now_ms = millis();
-                if (audioDebugEnabled && (now_ms - last_report_ms > 2000)) {
-                    Serial.printf("STATUS t=%lu thr=%.4f noise_max=%.4f snr=%.1f cracks=%u\n",
-                                  now_ms, stats.threshold, max_observed, stats.snr_db, stats.crack_count);
-                    last_report_ms = now_ms;
-                    max_observed   = 0.0f;
-                }
-
-                // Détection de crack — boucle sample
-                static float last_amp    = 0.0f;
-                bool         crack_found = false;
-
-                // Statistiques par buffer pour log d'analyse
-                float buf_peak           = 0.0f;
-                float buf_rms_sq         = 0.0f;
-                int   near_miss_thr      = 0;      // dépasse seuil mais front trop doux
-                int   near_miss_rise     = 0;      // front abrupt mais sous le seuil
-                float near_miss_thr_amp  = 0.0f;
-                float near_miss_rise_amp = 0.0f;
-
-                for (int i = 0; i < n; i++)
-                {
-                    float amp = fabsf(output_f[i]);
-
-                    if (amp > max_observed) max_observed = amp;
-                    if (amp > buf_peak)     buf_peak     = amp;
-                    buf_rms_sq += amp * amp;
-
-                    bool over_threshold = (amp > stats.threshold);
-                    bool sharp_rise     = (amp > last_amp * 3.0f);
-
-                    // Condition : dépasse le seuil ET front montant net (x3)
-                    if (over_threshold && sharp_rise)
-                    {
-                        TickType_t now_ticks = xTaskGetTickCount();
-                        if ((now_ticks - last_crack_time) > pdMS_TO_TICKS(DSP_DEAD_TIME_MS))
-                        {
-                            portENTER_CRITICAL(&crack_mux);
-                            crack_counter++;
-                            int32_t val = crack_counter;
-                            portEXIT_CRITICAL(&crack_mux);
-
-                            stats.crack_count = (uint32_t)val;
-                            if (amp > stats.peak_amplitude) stats.peak_amplitude = amp;
-
-                            last_crack_time = now_ticks;
-                            crack_found     = true;
-
-                            // LOG CRACK parseable
-                            Serial.printf("CRACK t=%lu n=%d amp=%.4f thr=%.4f rise=%.2f\n",
-                                          millis(), val, amp, stats.threshold,
-                                          (last_amp > 0.0001f) ? amp / last_amp : 0.0f);
-                        }
-                        else if (audioDebugEnabled)
-                        {
-                            Serial.printf("CRACK_SKIP t=%lu amp=%.4f dead_ms=%ld\n",
-                                          millis(), amp,
-                                          (long)(pdMS_TO_TICKS(DSP_DEAD_TIME_MS) -
-                                                 (xTaskGetTickCount() - last_crack_time)) *
-                                                portTICK_PERIOD_MS);
-                        }
-                    }
-                    else if (over_threshold && !sharp_rise && audioDebugEnabled)
-                    {
-                        // Dépasse seuil mais front trop progressif — faux négatif potentiel
-                        near_miss_thr++;
-                        if (amp > near_miss_thr_amp) near_miss_thr_amp = amp;
-                    }
-                    else if (!over_threshold && sharp_rise && amp > stats.threshold * 0.5f && audioDebugEnabled)
-                    {
-                        // Front abrupt mais sous le seuil — seuil peut-être trop haut
-                        near_miss_rise++;
-                        if (amp > near_miss_rise_amp) near_miss_rise_amp = amp;
-                    }
-
-                    last_amp = amp;
-                }
-
-                // LOG BUF — une ligne par buffer (base de l'analyse)
-                float buf_rms = sqrtf(buf_rms_sq / n);
-                Serial.printf("BUF t=%lu cnt=%u peak=%.4f rms=%.4f thr=%.4f snr=%.1f",
-                              millis(), stats.crack_count, buf_peak, buf_rms, stats.threshold,
-                              20.0f * log10f(buf_peak / fmaxf(stats.noise_floor_rms, 1e-9f)));
-                if (audioDebugEnabled && (near_miss_thr > 0 || near_miss_rise > 0)) {
-                    Serial.printf(" nm_thr=%d(%.4f) nm_rise=%d(%.4f)",
-                                  near_miss_thr, near_miss_thr_amp,
-                                  near_miss_rise, near_miss_rise_amp);
-                }
-                Serial.println();
-
-                // FIX #1 : analyzeFrequency appelée UNE SEULE FOIS après la boucle
-                if (crack_found) {
-                    analyzeFrequency(output_f, n);
-                }
-            }
-
-            // Surveillance stack périodique (toutes les ~100 lectures)
-            if (++check_count >= 100) {
-                uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-                Serial.printf("Stack High Water Mark : %d free words\n", uxHighWaterMark);
-                check_count = 0;
-            }
-        }
-        else
-        {
-            // Pause / non calibré
-            if (last_status_was_running) {
-                last_status_was_running = false;
-                Serial.println("Audio process - Monitor logic paused");
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
 
-        // Respiration minimale pour BLE / système
-        vTaskDelay(1);
+        // ---- ON edge: start a fresh detection session ----
+        if (!was_counting) {
+            memset(frame_raw, 0, sizeof(frame_raw));
+            memset(frame_bp , 0, sizeof(frame_bp));
+            memset(prev_mag , 0, sizeof(prev_mag));
+            filter_state[0] = filter_state[1] = 0.0f;
+            flux_base = flux_dev = prev_flux = 0.0f;
+            last_onset_ms = 0;
+            frames_seen   = 0;                    // <-- ADD
+            i2s_zero_dma_buffer(I2S_PORT);        // <-- ADD : drop stale backlog, start on live audio
+            t_start = last_status = millis();
+            Serial.printf("#TILAU_AUDIO start ms=%lu fs=%d fft=%d hop=%d band=%.0f-%.0f alpha=%.3f K=%.1f crest=%.1f refr=%d\n",
+                          t_start, I2S_SAMPLE_RATE, FFT_SIZE, HOP, FLUX_F_LO, FLUX_F_HI, FLUX_ALPHA, fluxK, CREST_MIN, REFRACTORY_MS);
+            was_counting = true;
+        }
+
+        // ---- one hop (128 samples ≈ 8 ms) ----
+        size_t bytesRead = 0;
+        if (i2s_read(I2S_PORT, raw, HOP * sizeof(int32_t), &bytesRead, portMAX_DELAY) != ESP_OK || bytesRead == 0) {
+            vTaskDelay(1); continue;
+        }
+        int n = bytesRead / sizeof(int32_t);
+
+        // shift sliding windows left by HOP
+        memmove(frame_raw, frame_raw + HOP, (FFT_SIZE - HOP) * sizeof(float));
+        memmove(frame_bp , frame_bp  + HOP, (FFT_SIZE - HOP) * sizeof(float));
+
+        // new hop: convert (24-in-32 >>8) + CONTINUOUS band-pass (state preserved)
+        float xhop[HOP], bhop[HOP];
+        for (int i = 0; i < n; i++) xhop[i] = (float)(raw[i] >> 8) / 8388608.0f;
+        dsps_biquad_f32_ansi(xhop, bhop, n, coeffs, filter_state);
+        for (int i = 0; i < HOP; i++) {
+            frame_raw[FFT_SIZE - HOP + i] = (i < n) ? xhop[i] : 0.0f;
+            frame_bp [FFT_SIZE - HOP + i] = (i < n) ? bhop[i] : 0.0f;
+        }
+
+        uint32_t now = millis();
+
+        {
+            static uint32_t last_raw_log = 0;
+            if (audioDebugEnabled && (now - last_raw_log) >= 1000) {
+                last_raw_log = now;
+                int32_t rmin = INT32_MAX, rmax = INT32_MIN;
+                for (int i = 0; i < n; i++) { if (raw[i] < rmin) rmin = raw[i]; if (raw[i] > rmax) rmax = raw[i]; }
+                Serial.printf("RAW min=%ld max=%ld\n", (long)rmin, (long)rmax);
+            }
+        }
+
+        // crest factor on band-passed window (impulsivity)
+        float peak = 0.0f, sumsq = 0.0f;
+        for (int i = 0; i < FFT_SIZE; i++) {
+            float a = fabsf(frame_bp[i]);
+            if (a > peak) peak = a;
+            sumsq += frame_bp[i] * frame_bp[i];
+        }
+        float rms   = sqrtf(sumsq / FFT_SIZE);
+        float crest = peak / (rms + 1e-9f);
+
+        // spectral flux on raw window (broadband onset)
+        for (int i = 0; i < FFT_SIZE; i++) {
+            fft_input[2*i]   = frame_raw[i] * fft_window[i];
+            fft_input[2*i+1] = 0.0f;
+        }
+        dsps_fft2r_fc32(fft_input, FFT_SIZE);
+        dsps_bit_rev_fc32(fft_input, FFT_SIZE);
+        float flux = 0.0f;
+        for (int k = k_lo; k <= k_hi; k++) {
+            float re = fft_input[2*k], im = fft_input[2*k+1];
+            float mag = sqrtf(re*re + im*im) / FFT_SIZE;
+            float d = mag - prev_mag[k];
+            if (d > 0.0f) flux += d;
+            prev_mag[k] = mag;
+        }
+
+        // adaptive threshold + onset decision
+        float thr = flux_base + fluxK * flux_dev;
+        bool warming = (frames_seen < WARMUP_FRAMES);
+        bool onset = (!warming) && (flux > thr) && (flux > prev_flux)
+                     && (crest > CREST_MIN) && ((now - last_onset_ms) > REFRACTORY_MS);
+        if (onset) {
+            portENTER_CRITICAL(&crack_mux);     // BLE GETCRACKCOUNTER reads crack_counter
+            crack_counter++;
+            int32_t val = crack_counter;
+            portEXIT_CRITICAL(&crack_mux);
+            stats.crack_count = (uint32_t)val;  // mirror for logs
+            last_onset_ms = now;
+        }
+        // update the floor ONLY when NOT an onset (cracks must not raise it)
+        if (!onset) {
+            flux_base += FLUX_ALPHA * (flux - flux_base);
+            flux_dev  += FLUX_ALPHA * (fabsf(flux - flux_base) - flux_dev);
+        }
+        prev_flux = flux;
+        frames_seen++;      
+
+        // per-frame machine log (debug gated)
+        if (audioDebugEnabled) {
+            Serial.printf("A %lu %.5f %.5f %.5f %.2f %.5f %d\n",
+                          now - t_start, flux, flux_base, thr, crest, rms, onset ? 1 : 0);
+        }
+        // lightweight human STATUS every 2 s (not debug-gated)
+        if (now - last_status >= 2000) {
+            last_status = now;
+            Serial.printf("STATUS t=%lu base=%.4f thr=%.4f crest=%.2f cracks=%u\n",
+                          now - t_start, flux_base, thr, crest, stats.crack_count);
+        }
     }
-
-    // Unreachable — mais propre si la tâche était un jour stoppée
-    heap_caps_free(raw);
-    monitorTaskHandle = NULL;
-    vTaskDelete(NULL);
+    // unreachable
 }
-
 // ---------------------------------------------------------------------------
 // Callbacks BLE
 // ---------------------------------------------------------------------------
@@ -707,26 +612,6 @@ void AudioDataCallbacks::onWrite(NimBLECharacteristic *pCharacteristic, NimBLECo
         Serial.println("Audio process - serial debug DISABLED");
         break;
 
-    case COMMAND_RAISERATIO:
-        stats.threshold *= 1.1f;
-        Serial.printf("Audio process - threshold raised to %.6f\n", stats.threshold);
-        break;
-
-    case COMMAND_DECREASERATIO:
-        stats.threshold *= 0.9f;
-        Serial.printf("Audio process - threshold lowered to %.6f\n", stats.threshold);
-        break;
-
-    case COMMAND_RAISERATIO5:
-        stats.threshold *= 1.5f;
-        Serial.printf("Audio process - threshold raised x1.5 to %.6f\n", stats.threshold);
-        break;
-
-    case COMMAND_DECREASERATIO5:
-        stats.threshold *= (1.0f / 1.5f);
-        Serial.printf("Audio process - threshold lowered /1.5 to %.6f\n", stats.threshold);
-        break;
-
     default:
         Serial.printf("Audio process - Unknown command: 0x%04X\n", cmd.command);
         break;
@@ -806,8 +691,8 @@ bool loadCalibrationFromFile()
         Serial.printf("Audio process - JSON parse error: %s\n", error.c_str());
         return false;
     }
-    if (!doc["threshold"] || !doc["peak_amplitude"] ||
-        !doc["noise_floor_rms"] || !doc["isCalibrated"]) {
+    if (!doc["threshold"].is<float>() || !doc["peak_amplitude"].is<float>() ||
+        !doc["noise_floor_rms"].is<float>() || !doc["isCalibrated"].is<bool>()) {
         Serial.println("Audio process - Calibration file incomplete.");
         return false;
     }
