@@ -43,7 +43,7 @@ The INMP441 microphone (I2S, also 3.3 V) goes on the left block: VDDâ†’3V3, GNDâ
 
 ## software and dependencies
 
-This project is built for PlatformIO, targeting the ESP32-S3 (Arduino-ESP32 3.x / IDF 5.x). Flash and monitor through the **"USB to serial" (CH343) USB-C port**, not the native-USB one.
+This project is built for PlatformIO, targeting the ESP32-S3 with Arduino-ESP32 2.0.x (espressif32 6.x, legacy I2S driver). Flash and monitor through the **"USB to serial" (CH343) USB-C port**, not the native-USB one.
 
 ## How to flash
 
@@ -107,7 +107,7 @@ when writing to the audio characteristic, sending a packet structure can trigger
 
 ### Operation & Status Indicators
 
-The built-in LED **GPIO2** provides a visual indication of the device's state. When the device is correctly started, it should blink once per second.
+The onboard **WS2812 RGB LED (GPIO48)** provides a visual indication of the device's state: blue blinking = advertising/ready, green = client connected, cyan = crack detection active, red blinking = calibration in progress.
 
 To operate, use the following:
 

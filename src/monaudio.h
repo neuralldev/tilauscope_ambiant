@@ -1,8 +1,8 @@
 #ifndef TILAUONAUDIO_H
 #define TILAUONAUDIO_H
 
-// ESP32-S3 / IDF 5.x : nouvelle API I2S "standard" (l'ancienne driver/i2s.h est dépréciée)
-#include <driver/i2s_std.h>
+// API I2S legacy (Arduino-ESP32 2.x / IDF 4.4) — fonctionne aussi sur l'ESP32-S3
+#include <driver/i2s.h>
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -59,10 +59,6 @@ extern float filter_state[2];
 #define I2S_SD_PIN    4     // Data In du micro (SD/DOUT) -> GPIO4
 #define I2S_SCK_PIN   6     // Bit Clock -> GPIO6
 #define I2S_PORT      I2S_NUM_0
-
-// Handle du canal RX I2S (nouvelle API). Créé dans setup() (main.cpp),
-// utilisé par calibrateTask / monitorAudioTask (monaudio.cpp).
-extern i2s_chan_handle_t rx_chan;
 
 // ---- Commandes BLE audio ----
 #define COMMAND_RUNCALIBRATION      0x0000
