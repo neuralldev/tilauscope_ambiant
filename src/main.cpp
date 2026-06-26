@@ -375,13 +375,10 @@ void setup()
   envAudioChar->setCallbacks(new AudioDataCallbacks());
 #endif
 
-  if (envService->start())
-    Serial.println("BLE server started");
-  else
-  {
-    Serial.println("BLE server failed to start, aborting");
-    return; // failed to start server, abort
-  }
+  // NimBLE 2.x : NimBLEService::start() est un no-op (déprécié). Les services
+  // sont activés au démarrage du serveur -> on démarre le serveur explicitement.
+  server->start();
+  Serial.println("BLE server started");
   Serial.println(">>-------------------------------------------------------------------------------------");
 
   // now start advertising
