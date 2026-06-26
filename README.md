@@ -10,7 +10,7 @@ The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy
 
 **Wireless Data**: Uses BLE (NimBLE stack) for low-power, short-range data transmission.
 **BME280 Sensor Integration**: Reads Temperature, Humidity, Pressure, and Altitude.
-**Unique Naming**: Generates a unique device name based on the ESP32's MAC address (TilauScope-Ambiant-XXXX).
+**Unique Naming**: Generates a unique device name based on the ESP32's MAC address (TLSCAMxxxxxxxx, last 8 hex of the MAC).
 **Efficient Data Format**: Transmits all sensor data in a single, compact, 17-byte packed structure with fixed-point scaling and a checksum.
 **Status Indicator**: Uses the onboard LED for connection and advertising status.
 **Robustness**: Includes a Simulation Mode fallback if the BME280 sensor is not detected.
@@ -19,24 +19,41 @@ The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy
 
 |Component              |Function                |Configuration                                 |
 |-----------------------|------------------------|----------------------------------------------|
-|Microcontroller        |ESP32 Development Board |NimBLE Stack                                  |
-|Environmental Sensor   |Adafruit BME280 (I2C)   |Addresses: 0x76 (Primary) or 0x77 (Alternate) |
-|I2C SDA Pin            |Data line for BME280    |GPIO 21                                       |
-|I2C SCL Pin            |Clock line for BME280   |GPIO 22                                       |
+|Microcontroller        |ESP32-S3-WROOM-1-N16R8 dev board (board `esp32-s3-devkitc-1`) |NimBLE stack, 16 MB flash + 8 MB octal PSRAM |
+|Status LED             |Onboard WS2812 RGB      |GPIO 48 (blue=advertising, green=connected, red=calibrating) |
+|Environmental Sensor   |Adafruit/GY BME280 (I2C, 3.3V) |Addresses: 0x76 (Primary) or 0x77 (Alternate) |
+|I2C SDA Pin            |Data line for BME280    |GPIO 8                                        |
+|I2C SCL Pin            |Clock line for BME280   |GPIO 9                                        |
+|I2S microphone         |INMP441 (WS/SCK/SD)     |GPIO 5 / 6 / 4                                |
+
+### BME280 wiring (terminal-adapter / screw-terminal carrier)
+
+The BME280 is powered at **3.3 V** (never 5 V — SDA/SCL must stay at 3.3 V logic for the ESP32-S3).
+
+| Wire color | Sensor pin | ESP32-S3 pin | Screw terminal (left block) |
+|------------|-----------|--------------|------------------------------|
+| Blue       | VIN       | 3V3          | 3.3V terminal                |
+| Green      | GND       | GND          | GND terminal                 |
+| Yellow     | SCL       | GPIO9        | IO9 terminal                 |
+| Orange     | SDA       | GPIO8        | IO8 terminal                 |
+
+> Do not trust the silkscreen printed on the adapter itself (CLK, P15, SD0…); it is generic and misleading. Match the GPIO numbers on the ESP32-S3 module instead — each screw connects to the module pin in line with it. Note: GPIO 26–37 are reserved for the N16R8 flash/PSRAM and must not be used.
+
+The INMP441 microphone (I2S, also 3.3 V) goes on the left block: VDD→3V3, GND→GND, WS→5, SD→4, SCK→6, L/R→GND.
 
 ## software and dependencies
 
-This project is built for the Arduino IDE or PlatformIO, targeting the ESP32.
+This project is built for PlatformIO, targeting the ESP32-S3 (Arduino-ESP32 3.x / IDF 5.x). Flash and monitor through the **"USB to serial" (CH343) USB-C port**, not the native-USB one.
 
 ## How to flash
 
-Flash using any utility. It must be done with SPI DIO Mode, not QIO. bootloader must be flashed first, then reset the module it will put itself in flashing mode and flash partitiontable, reboot it again and firmware.bin. 
+Easiest: `pio run -t upload` (PlatformIO handles offsets and flash mode). For a manual flash, the ESP32-S3 uses **QIO** flash mode and the **bootloader sits at 0x0** (not 0x1000 like the classic ESP32):
 
-| File.                | Adres       |
-| -------------------- | ----------- |
-| `bootloader.bin`     | **0x1000**  | 
-| `partitiontable.bin` | **0x8000**  | 
-| `firmware.bin`       | **0x10000** | 
+| File.                | Address (ESP32-S3) |
+| -------------------- | ------------------ |
+| `bootloader.bin`     | **0x0**            |
+| `partitiontable.bin` | **0x8000**         |
+| `firmware.bin`       | **0x10000**        |
 
 ### Required Librarie
 
@@ -80,14 +97,6 @@ when writing to the audio characteristic, sending a packet structure can trigger
 | 0x55 0x55 | 00 01       |    nn    | 0xaa 0xaa| ask the probe to start to detect cracks, the counter is incremented      |
 |-----------|-------------|----------|----------|--------------------------------------------------------------------------|
 | 0x55 0x55 | 00 02       |    nn    | 0xaa 0xaa| ask the probe to stop to detect cracks, the counter is reset to 0        |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 06       |    nn    | 0xaa 0xaa| raise ratio of detection by 0.1                                          |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 07       |    nn    | 0xaa 0xaa| decrease ratio of detection by 0.1                                       |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 05 06       |    nn    | 0xaa 0xaa| raise ratio of detection by 0.5                                          |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 05 07       |    nn    | 0xaa 0xaa| decrease ratio of detection by 0.5                                       |
 |-----------|-------------|----------|----------|--------------------------------------------------------------------------|
 | 0x55 0x55 | 00 10       |    nn    | 0xaa 0xaa| set debug on serial port, else save cpu for work                         |
 |-----------|-------------|----------|----------|--------------------------------------------------------------------------|

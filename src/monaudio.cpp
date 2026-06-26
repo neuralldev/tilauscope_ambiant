@@ -6,15 +6,18 @@
 //#define TESTMODE
 
 /*
-Brochage typique INMP441 ↔ ESP32
-INMP441     ESP32       Fonction
+Brochage INMP441 ↔ ESP32-S3 (DevKitC-1 N16R8)
+INMP441     ESP32-S3    Fonction
 VDD         3.3 V       Alimentation
 GND         GND         Masse
-WS (LRCL)   GPIO 25     Word Select
-SCK (BCLK)  GPIO 33     Bit Clock
-SD (DOUT)   GPIO 32     Données
+WS (LRCL)   GPIO 5      Word Select
+SCK (BCLK)  GPIO 6      Bit Clock
+SD (DOUT)   GPIO 4      Données (entrée du S3)
 L/R         GND         Canal gauche (Left)
 */
+
+// Handle du canal RX I2S (nouvelle API std). Initialisé dans setup() (main.cpp).
+i2s_chan_handle_t rx_chan = NULL;
 
 // ---------------------------------------------------------------------------
 // Mutex pour crack_counter (partagé entre task audio et callbacks BLE)
@@ -31,6 +34,11 @@ volatile bool audioStarted       = false;
 volatile bool calibrating        = false;
 volatile bool audioDebugEnabled  = false;  // activé via COMMAND_DEBUG_ON
 volatile float fluxK = 5.0f;          // thr = base + fluxK * dev
+
+// Handshake I2S : true quand monitorAudioTask NE touche PAS le bus I2S.
+// calibrate() attend ce flag avant de lancer calibrateTask, pour éviter deux
+// i2s_read() concurrents sur le même port (samples scindés -> calibration faussée).
+volatile bool monitorAudioIdle = true;
 
 NimBLECharacteristic *envAudioChar = nullptr;
 
@@ -136,8 +144,8 @@ void calibrateTask(void *pvParameters)
 
     while (millis() - start < CALIB_TIME_MS) {
         size_t    bytesRead = 0;
-        esp_err_t result    = i2s_read(I2S_PORT, raw, BUFFER_SIZE * sizeof(int32_t),
-                                       &bytesRead, portMAX_DELAY);
+        esp_err_t result    = i2s_channel_read(rx_chan, raw, BUFFER_SIZE * sizeof(int32_t),
+                                               &bytesRead, portMAX_DELAY);
 
         if (result == ESP_OK && bytesRead > 0) {
             int   n               = bytesRead / sizeof(int32_t);
@@ -302,6 +310,21 @@ void calibrate()
         Serial.println("Audio process - Calibration already running!");
         return;
     }
+
+    // Stopper la détection et ATTENDRE que monitorAudioTask relâche le bus I2S
+    // avant d'en lancer un second lecteur (calibrateTask). Sans cette barrière, les
+    // deux i2s_read() se partagent les samples -> stats de calibration corrompues.
+    crackCounterStatus = false;
+    if (monitorTaskHandle != NULL) {
+        const uint32_t t0 = millis();
+        while (!monitorAudioIdle && (millis() - t0) < 500) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (!monitorAudioIdle) {
+            Serial.println("Audio process - WARN: monitor still active, calibration may be noisy");
+        }
+    }
+
     calibrating = true;
 
     // Réinitialiser le compteur de façon thread-safe
@@ -381,6 +404,7 @@ void monitorAudioTask(void *pvParameters)
     {
         // ---- OFF state ----
         if (!crackCounterStatus) {
+            monitorAudioIdle = true;   // I2S bus released : calibrate() may proceed
             if (was_counting) {
                 Serial.printf("#TILAU_AUDIO stop ms=%lu cracks=%u\n", millis(), stats.crack_count);
                 was_counting = false;
@@ -388,6 +412,9 @@ void monitorAudioTask(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        // Active : on s'apprête à lire le bus I2S — interdit la calibration concurrente
+        monitorAudioIdle = false;
 
         // ---- ON edge: start a fresh detection session ----
         if (!was_counting) {
@@ -397,8 +424,10 @@ void monitorAudioTask(void *pvParameters)
             filter_state[0] = filter_state[1] = 0.0f;
             flux_base = flux_dev = prev_flux = 0.0f;
             last_onset_ms = 0;
-            frames_seen   = 0;                    // <-- ADD
-            i2s_zero_dma_buffer(I2S_PORT);        // <-- ADD : drop stale backlog, start on live audio
+            frames_seen   = 0;
+            // drop stale DMA backlog -> start on live audio (équivalent i2s_zero_dma_buffer)
+            i2s_channel_disable(rx_chan);
+            i2s_channel_enable(rx_chan);
             t_start = last_status = millis();
             Serial.printf("#TILAU_AUDIO start ms=%lu fs=%d fft=%d hop=%d band=%.0f-%.0f alpha=%.3f K=%.1f crest=%.1f refr=%d\n",
                           t_start, I2S_SAMPLE_RATE, FFT_SIZE, HOP, FLUX_F_LO, FLUX_F_HI, FLUX_ALPHA, fluxK, CREST_MIN, REFRACTORY_MS);
@@ -407,7 +436,7 @@ void monitorAudioTask(void *pvParameters)
 
         // ---- one hop (128 samples ≈ 8 ms) ----
         size_t bytesRead = 0;
-        if (i2s_read(I2S_PORT, raw, HOP * sizeof(int32_t), &bytesRead, portMAX_DELAY) != ESP_OK || bytesRead == 0) {
+        if (i2s_channel_read(rx_chan, raw, HOP * sizeof(int32_t), &bytesRead, portMAX_DELAY) != ESP_OK || bytesRead == 0) {
             vTaskDelay(1); continue;
         }
         int n = bytesRead / sizeof(int32_t);

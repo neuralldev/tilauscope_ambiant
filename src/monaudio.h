@@ -1,7 +1,8 @@
 #ifndef TILAUONAUDIO_H
 #define TILAUONAUDIO_H
 
-#include <driver/i2s.h>
+// ESP32-S3 / IDF 5.x : nouvelle API I2S "standard" (l'ancienne driver/i2s.h est dépréciée)
+#include <driver/i2s_std.h>
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -52,11 +53,16 @@ extern float filter_state[2];
 #define BPF_CENTER_FREQ     2500.0f
 #define BPF_Q               1.2f
 
-// Pins I2S INMP441
-#define I2S_WS_PIN    25    // L/R Clock (Word Select)
-#define I2S_SD_PIN    32    // Data Out (SD/DOUT)
-#define I2S_SCK_PIN   33    // Bit Clock
+// Pins I2S INMP441 — ESP32-S3 (les GPIO 25/32/33 du WROOM-32 n'existent pas
+// ou sont réservés à la PSRAM/flash octale sur le N16R8)
+#define I2S_WS_PIN    5     // L/R Clock (Word Select) -> GPIO5
+#define I2S_SD_PIN    4     // Data In du micro (SD/DOUT) -> GPIO4
+#define I2S_SCK_PIN   6     // Bit Clock -> GPIO6
 #define I2S_PORT      I2S_NUM_0
+
+// Handle du canal RX I2S (nouvelle API). Créé dans setup() (main.cpp),
+// utilisé par calibrateTask / monitorAudioTask (monaudio.cpp).
+extern i2s_chan_handle_t rx_chan;
 
 // ---- Commandes BLE audio ----
 #define COMMAND_RUNCALIBRATION      0x0000

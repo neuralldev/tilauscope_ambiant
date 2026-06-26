@@ -21,11 +21,16 @@
 // BLE Characteristic UUID for the environmental data
 #define ENV_DATA_CHAR_UUID "F3B6A2A0-8C4E-4E1F-9C2D-1A7F5B9A1C05"
 
-#define LED_PIN 2           // Built-in LED pin on most ESP32 Dev Kits
+#define RGB_LED_PIN 48      // LED RGB WS2812 intégrée du DevKitC-1 (statut couleur)
 #define BLINK_INTERVAL 1000 // LED blink interval in milliseconds (1 second)
 
-#define SDA_PIN 21 // I2C Data Pin for the BME280
-#define SCL_PIN 22 // I2C Clock Pin for the BME280
+// Câblage BME280 (I2C, 3.3V) sur ESP32-S3 DevKitC-1 + terminal adapter :
+//   VIN  (fil bleu)   -> 3V3   (bloc gauche, borne 3.3V)
+//   GND  (fil vert)   -> GND   (bloc gauche, borne GND)
+//   SCL  (fil jaune)  -> GPIO9 (bloc gauche, borne IO9)
+//   SDA  (fil orange) -> GPIO8 (bloc gauche, borne IO8)
+#define SDA_PIN 8 // I2C Data Pin for the BME280  (fil orange)
+#define SCL_PIN 9 // I2C Clock Pin for the BME280 (fil jaune)
 
 // --- Global Variables for BME support ---
 Adafruit_BME280 bme;               // BME280 sensor object
@@ -170,7 +175,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
 // --- Setup ---
 void setup()
 {
-  Serial.begin(921600);
+  Serial.begin(115200);
   // Activer le niveau DEBUG pour le tag AUDIO sur le port debug-console
   // Permet de voir ESP_LOGD(TAG_MON, ...) depuis /dev/cu.debug-console
   esp_log_level_set("AUDIO", ESP_LOG_DEBUG);
@@ -223,10 +228,9 @@ void setup()
   }
   delay(100);
 
-  // Configure the LED pin
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Ensure LED is off initially
-  Serial.println("LED configured to blink every second");
+  // LED RGB de statut (WS2812 intégrée) — éteinte au boot
+  rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
+  Serial.println("RGB status LED configured (GPIO48)");
 
   // Disable WiFi to free the radio for BLE — the MAC stays readable from efuse
   WiFi.mode(WIFI_MODE_NULL);
@@ -244,42 +248,48 @@ void setup()
 
 #if defined(TILAUONAUDIO_H)
 
-  // now working on audio threads
-  // set I2S default values for acquiring 24 bits data from microphone
+  // now working on audio threads — I2S RX en nouvelle API "standard" (IDF 5.x)
+  // pour acquérir les 24 bits utiles (dans des trames de 32 bits) de l'INMP441
   esp_err_t err = ESP_OK;
 
-  i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-      .sample_rate = I2S_SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,      // <-- Assurer 32 bits
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // <-- Assurer mono (canal gauche)
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard      
-      .intr_alloc_flags = 0,
-      .dma_buf_count = 8,
-      .dma_buf_len = 256,
-      .use_apll = false,
-      .tx_desc_auto_clear = false,
-      .fixed_mclk = 0};
+  // 1) Canal RX (handle global rx_chan, partagé avec les tâches audio)
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num  = 8;    // ex-dma_buf_count
+  chan_cfg.dma_frame_num = 256;  // ex-dma_buf_len
 
-  i2s_pin_config_t pin_config = {// change pin settings in .H header file if necessary (13,14,34)
-                                 .bck_io_num = I2S_SCK_PIN,
-                                 .ws_io_num = I2S_WS_PIN,
-                                 .data_out_num = I2S_PIN_NO_CHANGE,
-                                 .data_in_num = I2S_SD_PIN};
-
-  Serial.println("try to install I2S interface");
-  err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  Serial.println("try to install I2S (std) RX channel");
+  err = i2s_new_channel(&chan_cfg, NULL, &rx_chan);   // RX uniquement (handle TX = NULL)
   if (err != ESP_OK)
   {
-    Serial.printf("Erreur i2s_driver_install: %d\n", err);
+    Serial.printf("Erreur i2s_new_channel: %d\n", err);
     audioStarted = false;
   }
   else
   {
-    err = i2s_set_pin(I2S_PORT, &pin_config);
+    // 2) Mode standard Philips, 32 bits, mono. INMP441 L/R=GND -> canal gauche.
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)I2S_SCK_PIN,
+            .ws   = (gpio_num_t)I2S_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = (gpio_num_t)I2S_SD_PIN,
+            .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
+        },
+    };
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;   // INMP441 sur le canal gauche
+
+    err = i2s_channel_init_std_mode(rx_chan, &std_cfg);
     if (err != ESP_OK)
     {
-      Serial.printf("Erreur i2s_set_pin: %d\n", err);
+      Serial.printf("Erreur i2s_channel_init_std_mode: %d\n", err);
+      audioStarted = false;
+    }
+    else if ((err = i2s_channel_enable(rx_chan)) != ESP_OK)
+    {
+      Serial.printf("Erreur i2s_channel_enable: %d\n", err);
       audioStarted = false;
     }
     else
@@ -290,7 +300,7 @@ void setup()
       if (err == ESP_OK)
       {
         audioStarted = true;
-        Serial.println("I2S started, listening to INMP441");
+        Serial.println("I2S (std) started, listening to INMP441");
       }
       else
       {
@@ -405,6 +415,37 @@ void setup()
   Serial.println(">>-------------------------------------------------------------------------------------");
 };
 
+// --- LED RGB de statut (WS2812 intégrée) ---
+//   calibration : rouge clignotant rapide
+//   advertising : bleu clignotant 1 Hz
+//   connecté    : vert fixe (cyan si détection de cracks active)
+static void updateStatusLed()
+{
+  static uint32_t lastToggle = 0;
+  static bool     blinkOn    = false;
+  static int      lastMode   = -1;
+  uint32_t        now        = millis();
+
+  // 1=calibration, 0=advertising, 3=connecté+détection, 2=connecté
+  int mode = calibrating ? 1 : (!deviceConnected ? 0 : (crackCounterStatus ? 3 : 2));
+
+  if (mode == 1) { // calibration : rouge clignotant rapide (250 ms)
+    if (now - lastToggle >= 250) {
+      lastToggle = now; blinkOn = !blinkOn;
+      rgbLedWrite(RGB_LED_PIN, blinkOn ? 80 : 0, 0, 0);
+    }
+  } else if (mode == 0) { // advertising : bleu clignotant 1 Hz
+    if (now - lastToggle >= BLINK_INTERVAL) {
+      lastToggle = now; blinkOn = !blinkOn;
+      rgbLedWrite(RGB_LED_PIN, 0, 0, blinkOn ? 60 : 0);
+    }
+  } else if (mode != lastMode) { // états fixes : écrire une seule fois (pas à chaque loop)
+    if (mode == 3) rgbLedWrite(RGB_LED_PIN, 0, 40, 40); // cyan = détection active
+    else           rgbLedWrite(RGB_LED_PIN, 0, 60, 0);  // vert = connecté
+  }
+  lastMode = mode;
+}
+
 // --- Loop ---
 void loop()
 {
@@ -426,21 +467,6 @@ void loop()
       Serial.println("Failed to create Monitor Task!");
     }
   }
-  if (!deviceConnected)
-  {
-    // If device is not connected, blink the LED (indicates advertising/ready state)
-    if (currentMillis - previousMillis >= BLINK_INTERVAL)
-    {
-      // Save the current time
-      previousMillis = currentMillis;
-      // Toggle the LED state
-      int ledState = digitalRead(LED_PIN);
-      digitalWrite(LED_PIN, !ledState);
-    }
-  }
-  else
-  {
-    // A device is connected: keep the LED ON steadily
-    digitalWrite(LED_PIN, HIGH);
-  }
+  (void)currentMillis;
+  updateStatusLed();
 }
