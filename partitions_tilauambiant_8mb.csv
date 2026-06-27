@@ -1,0 +1,12 @@
+# TilauAmbiant partition table — ESP32-S3-WROOM-1-N8R8
+# 8 MB flash (0x800000) + 8 MB octal PSRAM
+# No OTA — sonde embarquée, mise à jour par câble uniquement
+# App : 3 MB (large marge pour NimBLE + I2S + DSP)
+# LittleFS : ~4.875 MB (calibrations + logs audio)
+#
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x300000,
+spiffs,   data, spiffs,   0x310000, 0x4E0000,
+coredump, data, coredump, 0x7F0000, 0x10000,
