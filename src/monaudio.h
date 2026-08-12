@@ -53,11 +53,19 @@ extern float filter_state[2];
 #define BPF_CENTER_FREQ     2500.0f
 #define BPF_Q               1.2f
 
-// Pins I2S INMP441 — ESP32-S3 (les GPIO 25/32/33 du WROOM-32 n'existent pas
-// ou sont réservés à la PSRAM/flash octale sur le N16R8)
-#define I2S_WS_PIN    5     // L/R Clock (Word Select) -> GPIO5
-#define I2S_SD_PIN    4     // Data In du micro (SD/DOUT) -> GPIO4
-#define I2S_SCK_PIN   6     // Bit Clock -> GPIO6
+// Pins I2S INMP441 — board-dependent.
+//  - ESP32-S3 (N8R8) : GPIO 4/5/6 (les 25/32/33 du WROOM-32 sont absents ou
+//    réservés flash/PSRAM octale sur le S3).
+//  - ESP32-WROOM-32D (classique) : GPIO 25/33/32.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define I2S_WS_PIN    5     // L/R Clock (Word Select) -> GPIO5
+  #define I2S_SD_PIN    4     // Data In du micro (SD/DOUT) -> GPIO4
+  #define I2S_SCK_PIN   6     // Bit Clock -> GPIO6
+#else  // ESP32-WROOM-32D
+  #define I2S_WS_PIN    25    // L/R Clock (Word Select) -> GPIO25
+  #define I2S_SD_PIN    32    // Data In du micro (SD/DOUT) -> GPIO32
+  #define I2S_SCK_PIN   33    // Bit Clock -> GPIO33
+#endif
 #define I2S_PORT      I2S_NUM_0
 
 // ---- Commandes BLE audio ----

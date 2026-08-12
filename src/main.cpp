@@ -1,6 +1,8 @@
 #include <Wire.h>
+#ifndef TILAU_AUDIO_ONLY
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#endif
 #include <NimBLEDevice.h>
 #include <numeric>
 #include <WiFi.h>   // Used only for MAC address to generate unique device name
@@ -21,9 +23,22 @@
 // BLE Characteristic UUID for the environmental data
 #define ENV_DATA_CHAR_UUID "F3B6A2A0-8C4E-4E1F-9C2D-1A7F5B9A1C05"
 
-#define RGB_LED_PIN 48      // LED RGB WS2812 intégrée du DevKitC-1 (statut couleur)
 #define BLINK_INTERVAL 1000 // LED blink interval in milliseconds (1 second)
 
+// --- LED de statut (board-dependent) ---
+//  - ESP32-S3 DevKitC-1 : WS2812 RGB intégrée sur GPIO48 (couleurs via neopixelWrite)
+//  - ESP32-WROOM-32D     : LED simple monochrome sur GPIO2 (allumée si couleur != noir)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define RGB_LED_PIN 48
+  static inline void statusLedBegin() {}
+  static inline void statusLed(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(RGB_LED_PIN, r, g, b); }
+#else
+  #define STATUS_LED_PIN 2
+  static inline void statusLedBegin() { pinMode(STATUS_LED_PIN, OUTPUT); }
+  static inline void statusLed(uint8_t r, uint8_t g, uint8_t b) { digitalWrite(STATUS_LED_PIN, (r | g | b) ? HIGH : LOW); }
+#endif
+
+#ifndef TILAU_AUDIO_ONLY
 // Câblage BME280 (I2C, 3.3V) sur ESP32-S3 DevKitC-1 + terminal adapter :
 //   VIN  (fil bleu)   -> 3V3   (bloc gauche, borne 3.3V)
 //   GND  (fil vert)   -> GND   (bloc gauche, borne GND)
@@ -31,22 +46,27 @@
 //   SDA  (fil orange) -> GPIO8 (bloc gauche, borne IO8)
 #define SDA_PIN 8 // I2C Data Pin for the BME280  (fil orange)
 #define SCL_PIN 9 // I2C Clock Pin for the BME280 (fil jaune)
+#endif
 
 // --- Global Variables for BME support ---
-Adafruit_BME280 bme;               // BME280 sensor object
-NimBLECharacteristic *envDataChar; // Pointer to the BLE Characteristic for ambiant data
 NimBLEAdvertising *pAdvertising;   // Pointer to the BLE Advertising object
 
 bool deviceConnected = false;
 unsigned long previousMillis = 0;  // For non-blocking timing (LED blink)
 unsigned long previousMillis1 = 0; // For non-blocking tempo display
-bool simulation = false;            // Flag to indicate if simulation mode is active (sensor failure)
 bool previous = true;              // used in test mode only
+
+#ifndef TILAU_AUDIO_ONLY
+Adafruit_BME280 bme;               // BME280 sensor object
+NimBLECharacteristic *envDataChar; // Pointer to the BLE Characteristic for ambiant data
+bool simulation = false;           // Flag to indicate if simulation mode is active (sensor failure)
 
 Adafruit_Sensor *bme_temp;
 Adafruit_Sensor *bme_pressure;
 Adafruit_Sensor *bme_humidity;
+#endif
 
+#ifndef TILAU_AUDIO_ONLY
 // --- Data Structure ---
 // Structure to hold environmental data for BLE transmission
 typedef struct __attribute__((packed))
@@ -137,6 +157,7 @@ class EnvironmentDataCallbacks : public NimBLECharacteristicCallbacks
     Serial.printf("Notification/Indication return code: %d, %s\n", code, NimBLEUtils::returnCodeToString(code));
   }
 };
+#endif  // !TILAU_AUDIO_ONLY
 
 // --- Server Callbacks (Handles Connection/Disconnection) ---
 class ServerCallbacks : public NimBLEServerCallbacks
@@ -183,6 +204,7 @@ void setup()
   esp_log_level_set("MON",   ESP_LOG_DEBUG);
   Serial.println(">>-------------------------------------------------------------------------------------");
   Serial.println("TilauScope Ambiant booting");
+#ifndef TILAU_AUDIO_ONLY
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000); // 100 kHz Standard I2C speed for better stability
   delay(100);
@@ -227,10 +249,14 @@ void setup()
     bme_humidity->printSensorDetails();
   }
   delay(100);
+#else
+  Serial.println("Build audio-only : BME280 désactivé.");
+#endif  // !TILAU_AUDIO_ONLY
 
-  // LED RGB de statut (WS2812 intégrée) — éteinte au boot
-  neopixelWrite(RGB_LED_PIN, 0, 0, 0);
-  Serial.println("RGB status LED configured (GPIO48)");
+  // LED de statut — éteinte au boot (WS2812 sur S3, LED simple sur WROOM-32D)
+  statusLedBegin();
+  statusLed(0, 0, 0);
+  Serial.println("Status LED configured");
 
   // Disable WiFi to free the radio for BLE — the MAC stays readable from efuse
   WiFi.mode(WIFI_MODE_NULL);
@@ -360,11 +386,13 @@ void setup()
   server->setCallbacks(new ServerCallbacks());
   // Create the Services and Characteristics
   NimBLEService *envService = server->createService(SERVICE_UUID);
+#ifndef TILAU_AUDIO_ONLY
   envDataChar = envService->createCharacteristic(
       ENV_DATA_CHAR_UUID,
       NIMBLE_PROPERTY::READ // The characteristic is only readable by the client
   );
   envDataChar->setCallbacks(new EnvironmentDataCallbacks());
+#endif
 
   // if audio is there, add the audio characteristics
 #if defined(TILAUONAUDIO_H)
@@ -424,16 +452,16 @@ static void updateStatusLed()
   if (mode == 1) { // calibration : rouge clignotant rapide (250 ms)
     if (now - lastToggle >= 250) {
       lastToggle = now; blinkOn = !blinkOn;
-      neopixelWrite(RGB_LED_PIN, blinkOn ? 80 : 0, 0, 0);
+      statusLed(blinkOn ? 80 : 0, 0, 0);
     }
   } else if (mode == 0) { // advertising : bleu clignotant 1 Hz
     if (now - lastToggle >= BLINK_INTERVAL) {
       lastToggle = now; blinkOn = !blinkOn;
-      neopixelWrite(RGB_LED_PIN, 0, 0, blinkOn ? 60 : 0);
+      statusLed(0, 0, blinkOn ? 60 : 0);
     }
   } else if (mode != lastMode) { // états fixes : écrire une seule fois (pas à chaque loop)
-    if (mode == 3) neopixelWrite(RGB_LED_PIN, 0, 40, 40); // cyan = détection active
-    else           neopixelWrite(RGB_LED_PIN, 0, 60, 0);  // vert = connecté
+    if (mode == 3) statusLed(0, 40, 40); // cyan = détection active
+    else           statusLed(0, 60, 0);  // vert = connecté
   }
   lastMode = mode;
 }
