@@ -9,6 +9,7 @@
 #include <algorithm>   // Used for string manipulation (std::remove)
 #include <string>
 #include <cmath> // Used for simulation functions (sin, cos)
+#include "door.h"
 // #include <esp_system.h>
 #include "esp_log.h" // Include this header at the top of main.cpp
 #include "common.h"
@@ -51,7 +52,7 @@
 // --- Global Variables for BME support ---
 NimBLEAdvertising *pAdvertising;   // Pointer to the BLE Advertising object
 
-bool deviceConnected = false;
+volatile uint8_t connectedClientCount = 0;
 unsigned long previousMillis = 0;  // For non-blocking timing (LED blink)
 unsigned long previousMillis1 = 0; // For non-blocking tempo display
 bool previous = true;              // used in test mode only
@@ -124,12 +125,28 @@ class EnvironmentDataCallbacks : public NimBLECharacteristicCallbacks
         Serial.printf("onread debug %f %f %f %f\n", temp_f, hum_f, press_f, alt_f);
     }
 
-    // Convert float to fixed-point integer (x10) and store in structure
-    // Adding 0.5 performs rounding to the nearest integer
-    data.temp_x10 = (int16_t)(temp_f * 10.0 + 0.5);
-    data.hum_x10 = (int16_t)(hum_f * 10.0 + 0.5);
-    data.press_x10 = (int32_t)(press_f * 10.0 + 0.5);
-    data.alt_x10 = (int32_t)(alt_f * 10.0 + 0.5);
+    // Convert float to fixed-point integer (x10). lroundf arrondit aussi
+    // correctement les valeurs negatives (+0.5 puis troncature ne le fait pas).
+    // Mesure invalide (NaN/inf) : convertir NaN en entier est un comportement
+    // indefini, le client recevrait des valeurs arbitraires avec un checksum
+    // valide. On envoie une sentinelle sur les quatre champs ; temp_x10 =
+    // INT16_MIN sort de la plage plausible de tilauambient.py, qui rejette
+    // alors toute la lecture.
+    if (isfinite(temp_f) && isfinite(hum_f) && isfinite(press_f) && isfinite(alt_f) &&
+        fabsf(temp_f) < 3000.0f && fabsf(hum_f) < 3000.0f)
+    {
+      data.temp_x10 = (int16_t)lroundf(temp_f * 10.0f);
+      data.hum_x10 = (int16_t)lroundf(hum_f * 10.0f);
+      data.press_x10 = (int32_t)lroundf(press_f * 10.0f);
+      data.alt_x10 = (int32_t)lroundf(alt_f * 10.0f);
+    }
+    else
+    {
+      data.temp_x10 = INT16_MIN;
+      data.hum_x10 = INT16_MIN;
+      data.press_x10 = INT32_MIN;
+      data.alt_x10 = INT32_MIN;
+    }
 
     // Calculate checksum over the data payload (excluding header and footer)
     // The payload starts right after the header field
@@ -167,11 +184,23 @@ class ServerCallbacks : public NimBLEServerCallbacks
    */
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo)
   {
-    Serial.println("Client connected. Advertising stopped.");
-    deviceConnected = true; // Update global state
+    connectedClientCount = pServer->getConnectedCount();
+    Serial.printf("BLE client connected: handle=%u address=%s clients=%u/%u\n",
+                  connInfo.getConnHandle(), connInfo.getAddress().toString().c_str(),
+                  connectedClientCount, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
 
     // Update connection parameters for potentially faster communication (optional)
     pServer->updateConnParams(connInfo.getConnHandle(), 24, 48, 0, 180);
+
+    // Une connexion BLE arrête normalement l'advertising. Le relancer tant
+    // qu'une place reste libre permet à TilauScope et au banc de se connecter.
+    if (connectedClientCount < CONFIG_BT_NIMBLE_MAX_CONNECTIONS &&
+        !pAdvertising->isAdvertising()) {
+      if (NimBLEDevice::startAdvertising())
+        Serial.println("BLE advertising continues for a second client.");
+      else
+        Serial.println("BLE warning: unable to resume advertising for second client.");
+    }
   }
 
   /**
@@ -179,9 +208,15 @@ class ServerCallbacks : public NimBLEServerCallbacks
    */
   void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override
   {
-    Serial.printf("Client disconnected - start advertising\n");
-    deviceConnected = false;          // Update global state
-    NimBLEDevice::startAdvertising(); // Restart advertising so other devices can connect
+    connectedClientCount = pServer->getConnectedCount();
+    Serial.printf("BLE client disconnected: handle=%u reason=%d clients=%u/%u\n",
+                  connInfo.getConnHandle(), reason, connectedClientCount,
+                  CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
+
+    // Après toute déconnexion il existe au moins une place. L'autre client,
+    // s'il est encore connecté, reste pleinement opérationnel.
+    if (!pAdvertising->isAdvertising() && !NimBLEDevice::startAdvertising())
+      Serial.println("BLE warning: unable to restart advertising.");
   }
 
   /**
@@ -196,7 +231,12 @@ class ServerCallbacks : public NimBLEServerCallbacks
 // --- Setup ---
 void setup()
 {
+#if defined(TILAU_AUDIO_STREAM)
+  Serial.setTxBufferSize(1024);   // marge pour les frames audio (261 B/hop)
+  Serial.begin(921600);           // 115200 ne tient pas le débit du stream audio brut
+#else
   Serial.begin(115200);
+#endif
   // Activer le niveau DEBUG pour le tag AUDIO sur le port debug-console
   // Permet de voir ESP_LOGD(TAG_MON, ...) depuis /dev/cu.debug-console
   esp_log_level_set("AUDIO", ESP_LOG_DEBUG);
@@ -208,6 +248,31 @@ void setup()
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000); // 100 kHz Standard I2C speed for better stability
   delay(100);
+  // Diagnostic câblage : scan du bus I2C + chip ID (0x60 = BME280, 0x58 = BMP280)
+  {
+    int found = 0;
+    for (uint8_t addr = 0x08; addr < 0x78; addr++)
+    {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() != 0)
+        continue;
+      found++;
+      int chipId = -1;
+      if (addr == 0x76 || addr == 0x77)
+      {
+        Wire.beginTransmission(addr);
+        Wire.write(0xD0); // chip ID register
+        if (Wire.endTransmission() == 0 && Wire.requestFrom(addr, (uint8_t)1) == 1)
+          chipId = Wire.read();
+      }
+      Serial.printf("I2C device at 0x%02X%s", addr, chipId >= 0 ? "" : "\n");
+      if (chipId >= 0)
+        Serial.printf(" chip ID 0x%02X (%s)\n", chipId,
+                      chipId == 0x60 ? "BME280" : chipId == 0x58 ? "BMP280" : "inconnu");
+    }
+    if (!found)
+      Serial.printf("I2C scan: aucun périphérique sur SDA=%d SCL=%d (câblage/alim ?)\n", SDA_PIN, SCL_PIN);
+  }
   // Attempt to initialize the BME280 sensor
   if (!bme.begin(BME280_ADDRESS))
   {
@@ -249,6 +314,7 @@ void setup()
     bme_humidity->printSensorDetails();
   }
   delay(100);
+  doorBegin();
 #else
   Serial.println("Build audio-only : BME280 désactivé.");
 #endif  // !TILAU_AUDIO_ONLY
@@ -263,8 +329,17 @@ void setup()
   delay(100);
   std::string macFull = WiFi.macAddress().c_str();
   // generate unique name based on MAC address
-  std::string identifier = macFull.substr(macFull.length() - 8);
-  identifier.erase(std::remove(identifier.begin(), identifier.end(), ':'), identifier.end());
+  // Garde : sur echec de lecture efuse, macAddress() renvoie une chaine vide et
+  // `length() - 8` deborde en size_t -> substr leve out_of_range, soit un
+  // abort() en boucle de boot avec le -fno-exceptions du core Arduino.
+  std::string identifier;
+  if (macFull.length() >= 8) {
+    identifier = macFull.substr(macFull.length() - 8);
+    identifier.erase(std::remove(identifier.begin(), identifier.end(), ':'), identifier.end());
+  } else {
+    Serial.println("MAC unreadable, falling back to a generic device name");
+    identifier = "000000";
+  }
   std::string baseName = "TLSCAM";
   std::string finalDeviceName = baseName + identifier;
   Serial.println(">>-------------------------------------------------------------------------------------");
@@ -274,62 +349,8 @@ void setup()
 
 #if defined(TILAUONAUDIO_H)
 
-  // now working on audio threads
-  // set I2S default values for acquiring 24 bits data from microphone
-  // API legacy driver/i2s.h (Arduino-ESP32 2.x) — fonctionne sur l'ESP32-S3
-  esp_err_t err = ESP_OK;
-
-  i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-      .sample_rate = I2S_SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,      // <-- Assurer 32 bits
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // <-- Assurer mono (canal gauche, INMP441 L/R=GND)
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S, // <-- Utiliser le format I2S standard
-      .intr_alloc_flags = 0,
-      .dma_buf_count = 8,
-      .dma_buf_len = 256,
-      .use_apll = false,
-      .tx_desc_auto_clear = false,
-      .fixed_mclk = 0};
-
-  i2s_pin_config_t pin_config = {// broches définies dans monaudio.h (S3 : 4/5/6)
-                                 .bck_io_num = I2S_SCK_PIN,
-                                 .ws_io_num = I2S_WS_PIN,
-                                 .data_out_num = I2S_PIN_NO_CHANGE,
-                                 .data_in_num = I2S_SD_PIN};
-
-  Serial.println("try to install I2S interface");
-  err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  if (err != ESP_OK)
-  {
-    Serial.printf("Erreur i2s_driver_install: %d\n", err);
-    audioStarted = false;
-  }
-  else
-  {
-    err = i2s_set_pin(I2S_PORT, &pin_config);
-    if (err != ESP_OK)
-    {
-      Serial.printf("Erreur i2s_set_pin: %d\n", err);
-      audioStarted = false;
-    }
-    else
-    { // configure DSP filter
-      // FIX : passe-bande centré 2500 Hz, Q=1.2 (~bande 1.5–4 kHz couvrant les fréquences de crack)
-      // dsps_biquad_gen_bpf_f32 génère un vrai BPF avec gain non-nul (vs bpf0db 0 dB peak)
-      err = dsps_biquad_gen_bpf_f32(coeffs, BPF_CENTER_FREQ / float(I2S_SAMPLE_RATE), BPF_Q);
-      if (err == ESP_OK)
-      {
-        audioStarted = true;
-        Serial.println("I2S started, listening to INMP441");
-      }
-      else
-      {
-        Serial.printf("Erreur dsps_biquad_gen_bpf_f32: %d\n", err);
-        audioStarted = false;
-      }
-    }
-  };
+  Serial.println("try to install audio interface");
+  audioStarted = (audioHwInit() == ESP_OK);
 
   Serial.println("Initializing File System...");
   // Tenter de monter LittleFS
@@ -364,9 +385,9 @@ void setup()
   // FIX #9 : tentative de chargement de la calibration existante au boot
   // Evite une recalibration si l'ESP32 redémarre en cours de torréfaction
   if (loadCalibrationFromFile()) {
-    Serial.println("Boot calibration restored from file - ready to START without CAL.");
+    Serial.println("Boot dual calibration restored (EMPTY + MAILLARD) - ready to START.");
   } else {
-    Serial.println("No valid calibration on file - send CAL command before START.");
+    Serial.println("Dual calibration incomplete - EMPTY then MAILLARD required before START.");
   }
 #endif
 
@@ -392,6 +413,7 @@ void setup()
       NIMBLE_PROPERTY::READ // The characteristic is only readable by the client
   );
   envDataChar->setCallbacks(new EnvironmentDataCallbacks());
+  doorAttach(envService);
 #endif
 
   // if audio is there, add the audio characteristics
@@ -447,7 +469,7 @@ static void updateStatusLed()
   uint32_t        now        = millis();
 
   // 1=calibration, 0=advertising, 3=connecté+détection, 2=connecté
-  int mode = calibrating ? 1 : (!deviceConnected ? 0 : (crackCounterStatus ? 3 : 2));
+  int mode = calibrating ? 1 : (connectedClientCount == 0 ? 0 : (crackCounterStatus ? 3 : 2));
 
   if (mode == 1) { // calibration : rouge clignotant rapide (250 ms)
     if (now - lastToggle >= 250) {
@@ -471,7 +493,23 @@ void loop()
 {
   // LED Blinking Management (Non-blocking)
   unsigned long currentMillis = millis();
-  if ((monitorTaskHandle == NULL) && (audioStarted && isCalibrated))
+  // selftestRequested : l'auto-test d'acquisition (COMMAND_AUDIO_SELFTEST) doit
+  // pouvoir tourner AVANT toute calibration -- c'est meme son seul interet.
+  // On cree donc aussi la tache dans ce cas ; elle reste ensuite en idle tant
+  // que crackCounterStatus est faux.
+  // monitorAudioFatal : la tache s'est abandonnee sur un echec d'init (FFT ou
+  // buffer DMA). Les conditions ci-dessous restent vraies, donc sans ce garde
+  // on la recreerait des milliers de fois par seconde.
+  // monitorRetryAt : meme probleme pour un echec de xTaskCreate (heap epuisee),
+  // sauf que celui-la est transitoire -> nouvelle tentative toutes les 2 s.
+  static unsigned long monitorRetryAt = 0;
+  // Course BLE (coeur 0) / tache monitor (coeur 1) : un SELFTEST peut passer
+  // le test monitorAudioFatal du callback juste avant que la tache meure.
+  // Personne d'autre ne l'executera : on le refuse ici.
+  if (monitorAudioFatal)
+    audioSelftestAbort("monitor_fatal");
+  if ((monitorTaskHandle == NULL) && audioStarted && !monitorAudioFatal &&
+      (isCalibrated || selftestRequested) && (long)(currentMillis - monitorRetryAt) >= 0)
   {
     Serial.println("Starting Monitor Audio Task...");
     BaseType_t xReturned = xTaskCreatePinnedToCore(
@@ -485,8 +523,18 @@ void loop()
     if (xReturned != pdPASS)
     {
       Serial.println("Failed to create Monitor Task!");
+      monitorRetryAt = currentMillis + 2000;
+      // Un auto-test en attente bloquerait toute calibration jusqu'a ce que la
+      // tache existe : on le refuse tout de suite, l'hote peut le redemander.
+      audioSelftestAbort("task_create");
     }
   }
-  (void)currentMillis;
+#if defined(TILAUONAUDIO_H)
+  audioPendingCalibrationService();   // barriere I2S + creation de calibrateTask
+  audioPendingSaveService();          // ecriture LittleFS demandee par un callback BLE
+#endif
+#ifndef TILAU_AUDIO_ONLY
+  doorService();
+#endif
   updateStatusLed();
 }

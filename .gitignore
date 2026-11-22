@@ -16,4 +16,7 @@ test/*
 test/README
 .gitgnore
 CLAUDE.md
+BACKLOG.md
 ALGO*.md
+tools/*
+.claude

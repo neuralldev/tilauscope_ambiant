@@ -2,33 +2,37 @@
 
 TilauScope Ambiant probe support
 
-## ESP32 + BME280 BLE Environmental Monitor
+## ESP32-S3 BLE probe: ambient sensor, first-crack detector, drop door
 
-The TilauScope Ambiant is an ESP32-based device acting as a Bluetooth Low Energy (BLE) peripheral to broadcast environmental data (Temperature, Humidity, Pressure, and Altitude). It utilizes the Adafruit BME280 sensor for measurements.
+TilauScope Ambiant is an ESP32-S3 Bluetooth Low Energy (BLE) peripheral used next to the roaster by TilauScope (a fork of Artisan). It provides:
+
+- ambient Temperature, Humidity, Pressure and Altitude from a BME280;
+- acoustic detection of coffee **first crack** with an ICS-43434 I2S MEMS microphone;
+- the state of the roaster's drop door (reed contact), so DROP is dated on the opening itself.
 
 ## Features
 
-**Wireless Data**: Uses BLE (NimBLE stack) for low-power, short-range data transmission.
-**BME280 Sensor Integration**: Reads Temperature, Humidity, Pressure, and Altitude.
-**Unique Naming**: Generates a unique device name based on the ESP32's MAC address (TLSCAMxxxxxxxx, last 8 hex of the MAC).
-**Efficient Data Format**: Transmits all sensor data in a single, compact, 17-byte packed structure with fixed-point scaling and a checksum.
-**Status Indicator**: Uses the onboard LED for connection and advertising status.
-**Robustness**: Includes a Simulation Mode fallback if the BME280 sensor is not detected.
+- **Wireless data**: NimBLE 2.x stack, up to two simultaneous clients (TilauScope plus the bench capture tool).
+- **Unique naming**: the device name is built from the MAC address (`TLSCAM` + last 3 bytes of the MAC in hex).
+- **Compact frames**: packed little-endian structures with fixed-point scaling and an additive checksum.
+- **Status LED**: onboard WS2812 RGB LED shows advertising, connection, detection and calibration.
+- **Persistent calibration**: the two calibration profiles are stored in LittleFS and restored at boot.
+- **Simulation mode**: if the BME280 is missing, the ambient characteristic returns synthetic values.
 
-## Hardware Requirements
+## Hardware
 
-|Component              |Function                |Configuration                                 |
-|-----------------------|------------------------|----------------------------------------------|
-|Microcontroller        |ESP32-S3-WROOM-1-N16R8 dev board (board `esp32-s3-devkitc-1`) |NimBLE stack, 16 MB flash + 8 MB octal PSRAM |
-|Status LED             |Onboard WS2812 RGB      |GPIO 48 (blue=advertising, green=connected, red=calibrating) |
-|Environmental Sensor   |Adafruit/GY BME280 (I2C, 3.3V) |Addresses: 0x76 (Primary) or 0x77 (Alternate) |
-|I2C SDA Pin            |Data line for BME280    |GPIO 8                                        |
-|I2C SCL Pin            |Clock line for BME280   |GPIO 9                                        |
-|I2S microphone         |INMP441 (WS/SCK/SD)     |GPIO 5 / 6 / 4                                |
+| Component            | Function                       | Configuration |
+|----------------------|--------------------------------|---------------|
+| Microcontroller      | ESP32-S3-WROOM-1-**N8R8** dev board (board `esp32-s3-devkitc-1`) | 8 MB flash, 8 MB octal PSRAM (PSRAM not enabled in the build). Sold as "N16R8", but the flash is 8 MB |
+| Status LED           | Onboard WS2812 RGB             | GPIO 48 |
+| Environmental sensor | BME280 (I2C, 3.3 V)            | Address 0x77, or 0x76 as fallback |
+| I2C SDA / SCL        | BME280 data / clock            | GPIO 8 / GPIO 9 |
+| I2S microphone       | ICS-43434 (WS / SCK / SD)      | GPIO 5 / 6 / 4, L/R to GND |
+| Drop door            | Reed switch (form A) to GND, 10 kΩ pull-up to 3V3 | GPIO 10 (LOW = door closed) |
 
-### BME280 wiring (terminal-adapter / screw-terminal carrier)
+### BME280 wiring (screw-terminal adapter)
 
-The BME280 is powered at **3.3 V** (never 5 V — SDA/SCL must stay at 3.3 V logic for the ESP32-S3).
+The BME280 is powered at **3.3 V**, never 5 V: SDA/SCL must stay at 3.3 V logic.
 
 | Wire color | Sensor pin | ESP32-S3 pin | Screw terminal (left block) |
 |------------|-----------|--------------|------------------------------|
@@ -37,190 +41,134 @@ The BME280 is powered at **3.3 V** (never 5 V — SDA/SCL must stay at 3.3 V log
 | Yellow     | SCL       | GPIO9        | IO9 terminal                 |
 | Orange     | SDA       | GPIO8        | IO8 terminal                 |
 
-> Do not trust the silkscreen printed on the adapter itself (CLK, P15, SD0…); it is generic and misleading. Match the GPIO numbers on the ESP32-S3 module instead — each screw connects to the module pin in line with it. Note: GPIO 26–37 are reserved for the N16R8 flash/PSRAM and must not be used.
+> Do not trust the silkscreen printed on the adapter (CLK, P15, SD0…): it is generic and misleading. Match the GPIO numbers on the ESP32-S3 module; each screw connects to the module pin in line with it. GPIO 26–37 are reserved for flash/PSRAM and must not be used.
 
-The INMP441 microphone (I2S, also 3.3 V) goes on the left block: VDD→3V3, GND→GND, WS→5, SD→4, SCK→6, L/R→GND.
+### ICS-43434 microphone wiring
 
-## software and dependencies
+| ICS-43434  | ESP32-S3 | Function          |
+|------------|----------|-------------------|
+| VDD        | 3V3      | Power             |
+| GND        | GND      | Ground            |
+| WS (LRCL)  | GPIO 5   | Word select       |
+| SCK (BCLK) | GPIO 6   | Bit clock         |
+| SD (DOUT)  | GPIO 4   | Data              |
+| L/R        | GND      | Left channel only |
 
-This project is built for PlatformIO, targeting the ESP32-S3 with Arduino-ESP32 2.0.x (espressif32 6.x, legacy I2S driver). Flash and monitor through the **"USB to serial" (CH343) USB-C port**, not the native-USB one.
+**Placement**: 30–40 cm from the roaster, at ear height, with no contact with the body of the machine. Mounted on the machine, the fan noise carried by the sheet metal masks the cracks.
 
-## How to flash
+Pictures: [ESP32-S3 board](include/boardesp32.jpg), [BME280](include/bme280.png), [ICS-43434](include/ICS-43434.jpg).
 
-Easiest: `pio run -t upload` (PlatformIO handles offsets and flash mode). For a manual flash, the ESP32-S3 uses **QIO** flash mode and the **bootloader sits at 0x0** (not 0x1000 like the classic ESP32):
+## Build and flash
 
-| File.                | Address (ESP32-S3) |
-| -------------------- | ------------------ |
+PlatformIO project, Arduino-ESP32 2.0.x (espressif32 6.x, legacy I2S driver). Three environments:
+
+| Environment       | Purpose | Serial speed |
+|-------------------|---------|--------------|
+| `esp32s3`         | Roast probe (BME280 + audio + door) | 115200 |
+| `esp32s3_devtest` | Test bench: also streams the raw audio on the UART for `tools/bench_capture.py` | 921600 |
+| `wroom32d`        | ESP32-WROOM-32D, audio only (no BME280, no door). I2S on WS=25, SCK=33, SD=32 | 115200 |
+
+The S3 board has two USB-C ports. Serial output goes to UART0, that is the **"USB to serial" (CH343)** port; the native-USB port is used for flashing in `env:esp32s3` but shows no serial output.
+
+Easiest: `pio run -e esp32s3 -t upload`. For a manual flash, the ESP32-S3 uses **DIO** flash mode and the **bootloader sits at 0x0** (not 0x1000 as on the classic ESP32):
+
+| File                 | Address (ESP32-S3) |
+|----------------------|--------------------|
 | `bootloader.bin`     | **0x0**            |
-| `partitiontable.bin` | **0x8000**         |
+| `partitions.bin`     | **0x8000**         |
 | `firmware.bin`       | **0x10000**        |
 
-### Required Librarie
+Libraries (installed by PlatformIO): NimBLE-Arduino 2.x, Adafruit BME280, Adafruit Unified Sensor, ArduinoJson 7, ESP-DSP (bundled with the core).
 
-To work on the code, install the following libraries via the Arduino Library Manager or PlatformIO Registry:
+## BLE interface
 
-- NimBLE-Arduino (or ESP32 BLE Library): For the Bluetooth Low Energy stack.
-- Adafruit BME280 Library
-- Adafruit Unified Sensor Library
-- ArduinoJson Library (for calibration persistence)
-- ESP-DSP (for FFT and biquad filtering)
+| Characteristic | UUID                                   | Access |
+|----------------|----------------------------------------|--------|
+| Service        | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c01` | advertised |
+| Ambient        | `f3b6a2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05` | READ |
+| Audio          | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c04` | READ / WRITE |
+| Drop door      | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c06` | READ |
 
-### Data Structure and Format
+Note that the ambient UUID starts with `f3b6a2a0`, not `f3b6e2a0` like the others. That is the value the TilauScope client uses.
 
-Data of ambiant information is packaged into a (17-bytes) struct (EnvData) using fixed-point representation (x10 scaling) for efficiency. Data of audio information is packaged into a (7-bytes) struct (AudioData) using int16 representation.
-Data of audio information is packaged into a (21-bytes) struct (AudioData) using `int32_t` representation for all the values.
+All frames are little-endian, start with header `0x5555` and end with footer `0xAAAA`. The checksum is the 8-bit sum of the payload bytes between header and checksum.
 
-### Decoding the Data
+### Ambient frame (17 bytes, READ)
 
-To retrieve the actual floating-point values, the received integer value must be divided by x 10.Checksum Verification: The checksum is calculated over the (12-byte) data payload (from temp_x10 to alt_x10). Clients should re-calculate this checksum and compare it to the received checksum field to ensure data integrity. all the values are coded in Little-Endian
+| header | temp_x10 (int16) | hum_x10 (int16) | press_x10 (int32, hPa) | alt_x10 (int32, m) | checksum | footer |
+|--------|------------------|-----------------|------------------------|--------------------|----------|--------|
 
-Ambiant payload is structured this way:
-| HEADER    | temp 28.8°C | hum 77.1%.  | press 990.1 mPa | alt 30masl   | checksum | footer   |
-|-----------|-------------|-------------|-----------------|--------------|----------|----------|
-| 0x55 0x55 | 00 00 01 20 | 00 00 03 03 | 00 00 26 AD     |  00 00 00 1E |    nn    | 0xaa 0xaa|
+Divide the values by 10 to get °C, %RH, hPa and metres.
 
-Audio payload to retrieve contains the actual crack counter when you read the audio characteristic
+### Audio frame (9 bytes, READ)
 
-| HEADER    | crack count | checksum | footer   |
-|-----------|-------------|----------|----------|
-| 0x55 0x55 | 00 00 00 10 |    nn    | 0xaa 0xaa|
+| header | crack_count (int32) | checksum | footer |
+|--------|---------------------|----------|--------|
 
-(crack count is int32 structure, here it is 0x10 -> 17 in decimal)
+`crack_count` is -1 while the probe is not calibrated (both profiles) or the microphone did not start, and during a calibration.
 
-when writing to the audio characteristic, sending a packet structure can trigger the crack counter logic:
+### Drop door frame (12 bytes, READ)
 
-| HEADER    | feature.    | checksum | footer   |function                                                                  |
-|-----------|-------------|----------|-------------------------------------------------------------------------------------|
-| 0x55 0x55 | 00 00       |    nn    | 0xaa 0xaa| Run calibration. the process last after 30 seconds                       |
-|                                               | function 1 and 2 are ignored until calibration has been successfully run |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 01       |    nn    | 0xaa 0xaa| ask the probe to start to detect cracks, the counter is incremented      |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 02       |    nn    | 0xaa 0xaa| ask the probe to stop to detect cracks, the counter is reset to 0        |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 10       |    nn    | 0xaa 0xaa| set debug on serial port, else save cpu for work                         |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
-| 0x55 0x55 | 00 11       |    nn    | 0xaa 0xaa| stop debug on serial port.                                               |
-|-----------|-------------|----------|----------|--------------------------------------------------------------------------|
- 
-(The `command` field is a 2-byte `int16_t` value. Write to GATT requires asking for a response (response=True) if awaited.)
+| header | open (u8) | open_count (u16) | since_open_ms (u32) | checksum | footer |
+|--------|-----------|------------------|---------------------|----------|--------|
 
-### Operation & Status Indicators
+`open_count` counts openings since boot; `since_open_ms` is the time since the last opening began, `0xFFFFFFFF` if none.
 
-The onboard **WS2812 RGB LED (GPIO48)** provides a visual indication of the device's state: blue blinking = advertising/ready, green = client connected, cyan = crack detection active, red blinking = calibration in progress.
+### Audio commands (7 bytes, WRITE)
 
-To operate, use the following:
+| header | command (int16) | checksum | footer |
+|--------|-----------------|----------|--------|
 
-- Wait for the probe to boot (automatic using TilauScope fork).
-- Try to detect the probe on the service UUID (automatic using TilauScope fork).
-- Start collecting data by reading the Ambiant UUID (automatic using TilauScope fork, mapping an extra device to the 4 values).
-- At DE (Development Environment), call CALIBRATION (function 0) by writing to the Audio UUID.
-- At DE+1mn, call START DETECTION (function 1) by writing to the Audio UUID.
-- At DROP, call STOP DETECTION (function 2) by writing to the Audio UUID.
+| Command        | Function |
+|----------------|----------|
+| `0x0000`       | EMPTY calibration: empty drum, machine running, 30 s |
+| `0x0006`       | MAILLARD calibration: beans loaded, after DE, 30 s. Needs a valid EMPTY profile |
+| `0x0001`       | Start crack detection (needs both profiles; refused while a calibration is pending or running) |
+| `0x0002`       | Stop crack detection |
+| `0x0003`       | Print calibration state |
+| `0x0004`       | Print sampling state and build identification |
+| `0x0005`       | Print crack counter |
+| `0x0007`       | Acquisition self-test (~2 s): prints `#TILAU_SELFTEST frames=… rms=… peak=…` |
+| `0x0010` / `0x0011` | Verbose serial debug on / off |
+| `0x0021`       | Print the confidence threshold |
+| `0x0100 + pct` | Set the confidence threshold to pct % (0–100), saved with the calibration |
 
-Calibration is stored in a file on the ESP32 file system. When the probe starts, it loads any previously saved calibration to skip this stage if the roast is going to be done under the same conditions (microphone placement, roaster at the same place, exhaust system at the same distance). We encourage you to take note of the exact placement of devices because of the nature of wave propagation, which can change a lot when shifting a device by a few centimeters. Calibration lasts for 30 seconds or so. When trying to find the right place, monitor your serial port to observe the detected signal shape and intensity. There are a lot of debug messages with graphical views to help you fine-tune the optimal position.
+Answers are printed on the serial port only. Write with response if you need to know the command was received.
 
-## Simulation Mode
+## Operation
 
-If the device fails to initialize the BME280 sensor (e.g., wiring error or sensor not present), it will automatically switch to Simulation Mode.
+LED: blue blinking = advertising, green = client connected, cyan = crack detection running, red fast blinking = calibration.
 
-    - Function: The onRead callback will generate smooth, sinusoidal, dummy environmental data instead of reading the sensor.
+Typical roast, driven automatically by TilauScope:
 
-    - Purpose: Allows for testing the BLE connectivity and data parsing logic of the client application without requiring the physical sensor.
+1. Once per setup (or after moving the microphone): with the drum empty and the machine running, send **EMPTY calibration** (`0x0000`).
+2. After DE, with the beans in, send **MAILLARD calibration** (`0x0006`). Pick a calm moment.
+3. Send **START** (`0x0001`) after the MAILLARD calibration has finished.
+4. At DROP, send **STOP** (`0x0002`).
 
-    - Serial Output: The device will log the message: BME280 not detected, errorr, enter simulation mode during setup.
+Both profiles are saved and restored at boot, so the calibrations can be skipped while the setup stays the same (microphone position, roaster, exhaust). Small changes in microphone position change the acoustics a lot: write the placement down. Calibrate again after any change.
 
-### cabling information
+First crack itself is reported on the serial port (`#TILAU_FC candidate …`, `#TILAU_FC confirmed …`); over BLE only the crack counter is available.
 
-| BME280 | ESP32 WROOM | Fonction          |
-|--------|-------------|-------------------|
-| VCC    | 3.3V -5V    | Power             |
-| GND    | GND         | Ground            |
-| SDA    | GPIO 21     | Data              |
-| SCL    | GPIO 22     | Clock             |       Example of cabling for microphone and proposed color coding for cable 
+## Simulation mode
 
-|NMP441     | ESP32    | Fonction          |       Green    L/R                   GND  Brown
-|-----------|----------|-------------------|
-|VDD        | 3.3 V    | Power             |       Yellow    WS                   VDD  Red
-|GND        | GND      | Ground            |
-|WS (LRCL)  | GPIO 32  | Word Select       |       Orange    SCK    MICROPHONE     SD  Black
-|SCK (BCLK) | GPIO 33  | Bit Clock         |
-|SD (DOUT)  | GPIO 25  | Data              |               ------  FACE VIEW ------
-|L/R        | GND      | Left channel only |
+If the BME280 is not found at boot, the ambient characteristic returns smooth sinusoidal values instead of measurements, so the BLE link and the client parsing can be tested without the sensor. The boot log then shows `BME280 not detected no secondary, enter simulation mode`.
 
-[esp32 module](esp32.png)
-[bme280 probe](bme280.png)
-[nmp441](nmp441.png)
+## First-crack detection algorithm
 
----
+First crack shows up as short impulsive "pops" over the continuous noise of the roaster (drum, fan, burner). With the microphone at 30–40 cm, cracks stand out best between 4 and 8 kHz, while 1.5–4 kHz is dominated by the fan.
 
-## UUID BLE used by project
+Pipeline, every 8 ms:
 
-| Caractéristique | UUID                                   |
-|-----------------|----------------------------------------|
-| Service         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c01` |
-| ambiant         | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c05` |
-| audio           | `f3b6e2a0-8c4e-4e1f-9c2d-1a7f5b9a1c04` |
+1. I2S at 16 kHz, 24-bit samples normalised to [-1, 1].
+2. Continuous band-pass biquad centred at 5.5 kHz (Q = 1.2).
+3. 256-sample Hann-windowed FFT with 50 % overlap.
+4. Features: spectral flux over 4–7.9 kHz, crest factor (peak/RMS) of the band-passed signal, spectral centroid of the flux band.
+5. Threshold: the larger of an adaptive EMA of the flux and a floor of 1.35 × the flux P99 measured during the MAILLARD calibration. The EMA is frozen while the flux is above threshold, so a burst of cracks does not raise it.
+6. Composite score: 0.45 × flux + 0.30 × crest + 0.25 × centroid sub-scores, compared to the confidence threshold (default 60 %, usable range 55–65 %).
+7. A crack is counted when the flux is above threshold, rising, the score is above the confidence threshold, and 150 ms have passed since the previous crack.
+8. A state machine turns crack density into a first-crack event: MONITORING → CANDIDATE (2 cracks in 5 s or 5 in 10 s) → CONFIRMED (6 cracks in 20 s, with 2 in the last 5 s). A candidate falls back after 8 s of silence or 25 s without confirmation.
 
-The **service** UUID is used only for advertising.
-Data exchange for environmental data is done using the **ambiant** UUID, and for audio data using the **audio** UUID. The ambiant data characteristic only accepts READ requests to query for values. The audio characteristic accepts both READ and WRITE operations. The payload is returned and must be unpacked.
+Each calibration records the same features over 30 s. The MAILLARD calibration removes transient peaks (louder than both the empty-drum profile and the loaded-drum background) before computing its statistics.
 
-## explanation on Audio-Based First Crack Detection: Algorithm Overview
-
-1. Problem Context
-
-During coffee roasting, first crack (FC) is a critical thermophysical event corresponding to rapid water vapor expansion and structural fracturing of the bean. Acoustically, it manifests as short, high-energy impulsive sounds (sharp “pops”) embedded in a background of continuous noise generated by the roaster (drum rotation, airflow, burner, cooling fan).
-
-The objective of the algorithm is to reliably detect the onset of first crack in real time using a microphone, despite a noisy and thermally harsh environment, and to do so with low latency suitable for roast control.
-
-The raw audio signal undergoes several preprocessing steps: 
- 
-    - Band-pass filtering. First crack energy is concentrated in the mid-to-high frequency range (typically ~1–6 kHz). Low-frequency components (drum rotation, airflow rumble) and very high-frequency noise are attenuated.
-
-    - Framing and windowing. Audio is processed in short, overlapping frames (e.g., 10–50 ms). This allows time-localized analysis of impulsive events.
-
-    - Amplitude normalization / AGC (optional). Compensates for gradual changes in overall noise level as airflow or burner power changes.
-
-For each audio frame, the algorithm computes features that emphasize impulsive, crack-like events:
- 
-    - Short-Time Energy (STE). Measures sudden bursts of acoustic energy.
-
-    - Spectral representation. Captures rapid changes in the frequency spectrum, characteristic of cracks.
-
-    - Zero-Crossing Rate (ZCR). Higher for sharp transient signals than for steady mechanical noise.
-
-    - High-frequency energy ratio. Ratio of energy above a given frequency threshold versus total energy.
-
-The core detection mechanism combines thresholding and temporal validation:
- 
-    - Adaptive thresholding. Thresholds are not fixed. A rolling baseline is computed from recent frames to model current background noise. A frame is marked as a candidate crack if one or more features exceed the baseline by a defined margin.
-
-    - Impulse validation. Candidate events must be short in duration, isolated (not sustained noise), and spectrally consistent with crack signatures.
-
-    - Burst detection. First crack is not a single event but the start of a statistically significant increase in crack rate. The algorithm tracks crack counts over a sliding time window. First crack is declared when the event density exceeds a minimum rate for a sustained period (e.g., several cracks within a few seconds).
-
-In practice, the detector is implemented as a state machine:
- 
-    - Idle / Pre-FC. Monitoring noise baseline; isolated pops are ignored.
-
-    - FC Candidate. Increased impulsive activity is detected; waiting for confirmation.
-
-    - First Crack Confirmed. Crack rate exceeds threshold; timestamp is latched and reported.
-
-Once first crack is detected:
-
-    - A timestamp (relative or absolute) is generated. This event can be:
-        - Logged for roast profiling.
-        - Sent via serial, MQTT, or REST to a roast controller.
-        - Used to trigger automated roast phase transitions (e.g., power or airflow changes).
-    - The algorithm is typically implemented in:
-        - C++ for embedded or low-latency systems.
-        - Python for prototyping, visualization, and offline validation.
-
-Key Challenges and Limitations
-    - Acoustic variability between roasters and microphone placements
-    - Overlapping noise from cooling fans or exhaust systems
-    - Second crack overlap in darker roasts
-    - Need for per-machine calibration
-
-As a result, most practical systems rely on tunable parameters rather than fully generic models.
+Settings are tuned by replaying recorded roasts offline (`tools/bench_capture.py` to record on the test bench, `tools/replay_detector.py` to replay) before flashing.
